@@ -52,3 +52,7 @@ ablation_*/
 md/*
 !md/CLIP-base-selector-vlm.md
 !md/LongMemory.md
+
+# example_memory_selector upload policy
+example_memory_selector/Selector_VLM/example/
+example_memory_selector/Selector_VLM/bolt_*/
