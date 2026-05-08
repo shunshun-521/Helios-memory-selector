@@ -27,7 +27,6 @@ example_memory_selector/
 └── Selector_VLM/
     ├── example_long/            # 处理后的范例数据
     ├── tools/offload_data/
-    │   ├── build_metadata.py    # 入口脚本（已精简）
     │   └── build_metadata_minimal.py
     └── README.md
 ```
@@ -51,13 +50,13 @@ python create_video.py --csv prompt/light_change.csv --duration 10 --resolution 
 - `failed.jsonl`：失败任务
 - `manifest.jsonl`：成功任务与原始 prompt
 
-> `metadata.json` / `metadata.jsonl` 不在这一步产出，它来自下一步 `build_metadata.py`。
+> `metadata.json` / `metadata.jsonl` 不在这一步产出，它来自下一步 `build_metadata_minimal.py`。
 
 ---
 
 ## 3. Step B: 构建 metadata（TransNetV2 + Qwen3-VL）
 
-`Selector_VLM/tools/offload_data/build_metadata.py` 已整理为“最小链路”入口：
+`Selector_VLM/tools/offload_data/build_metadata_minimal.py` 为当前唯一元数据构建脚本：
 
 - 分镜：仅 `TransNetV2`
 - prompt 生成：仅 `Qwen-VL visual_batch`
@@ -66,7 +65,7 @@ python create_video.py --csv prompt/light_change.csv --duration 10 --resolution 
 
 ```bash
 conda activate helios
-python /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/tools/offload_data/build_metadata.py \
+python /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/tools/offload_data/build_metadata_minimal.py \
   --videos_dir /root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change/videos \
   --out_json /root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change/metadata.json \
   --seg_method scenedetect \
@@ -122,13 +121,18 @@ torchrun --nproc_per_node 1 tools/offload_data/get_short-latents.py \
 
 ---
 
-## 5. Step D: 后续对接
+## 5. Step D: 训练与推理对接说明
 
 有了 `metadata.json + latents_short` 后，你可以继续用于：
 
-- Selector 训练数据构建
-- LongMemory / Codebook 检索策略验证
-- Ref-Attn 训练和评估
+- Ref-Attn 训练与评估
+- LongMemory / Codebook 推理检索验证
+
+当前项目约定：
+
+- **训练路径**：通过 `scripts/training/train_bolt.sh` 调用 `scripts/training/configs/bolt_ref_attn.yaml`。
+- **训练粒度**：每个 step 优化一个 `chunk_idx` 对应 chunk，使用该 chunk 对应的 caption/prompt。
+- **LongMemory/Codebook**：仅在推理中启用，不参与训练参数更新。
 
 具体模型下载与依赖请看：`example_memory_selector/Selector_VLM/README.md`。
 

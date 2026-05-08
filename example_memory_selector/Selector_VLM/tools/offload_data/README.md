@@ -2,8 +2,7 @@
 
 本目录当前建议只关注一个入口：
 
-- `build_metadata.py`：对外入口（兼容旧调用）
-- `build_metadata_minimal.py`：实际执行逻辑（精简版）
+- `build_metadata_minimal.py`：实际执行脚本（精简版）
 
 精简版只保留两条能力：
 
@@ -41,7 +40,7 @@ python -c "from modelscope import snapshot_download; snapshot_download('Qwen/Qwe
 
 ```bash
 conda activate helios
-python /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/tools/offload_data/build_metadata.py \
+python /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/tools/offload_data/build_metadata_minimal.py \
   --videos_dir /root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change/videos \
   --out_json /root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change/metadata.json \
   --seg_method scenedetect \
@@ -67,7 +66,7 @@ python /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/tools/offloa
 
 ## 5) 关于 `build_metadata_minimal.py`
 
-- 这是你当前版本的“最小可维护实现”。
-- `build_metadata.py` 只是入口壳，默认会转到 `build_metadata_minimal.py`。
-- 所以你可以把它理解为：**最小版已经可以替代你现在这条数据处理链路**（TransNetV2 + Qwen3-VL）。
+- 这是当前唯一保留的元数据脚本。
+- 可以直接替代你们之前的冗余版本。
+- 覆盖你现在的主链路：**TransNetV2 + Qwen3-VL**。
 

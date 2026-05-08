@@ -47,7 +47,6 @@
 
 - 推理入口：`infer_helios_bolt.py`
 - Ref-Attn 训练：`train_helios_bolt.py`
-- Selector 训练：`train_helios_selector_vlm.py`
 - VLM 选帧模块：`helios/modules/select_frames_vlm.py`
 - 长记忆模块：`helios/modules/long_memory.py`
 - codebook/记忆管理：`helios/modules/memory_bank.py`
@@ -84,17 +83,22 @@ bash scripts/inference/helios-base_t2v.sh
 
 ## 5. 训练建议
 
-### 5.1 VLM Selector 蒸馏训练
+### 5.1 Bolt Ref-Attn 训练（当前唯一训练路径）
 
-- 先离线准备 selector 数据（候选帧 + soft/hard 标签）
-- 训练目标建议采用 soft + hard 组合（KL + CE）
-- 先用 `topk` 路径验证稳定性，再尝试 `its` 做多样性对比
-
-### 5.2 Bolt Ref-Attn 训练
+- 训练入口：`scripts/training/train_bolt.sh`
+- 配置入口：`scripts/training/configs/bolt_ref_attn.yaml`
+- 训练机制：每个 step 采样一个 `chunk_idx`（target chunk），并使用该 chunk 对应段落的 caption/prompt 作为条件进行优化
+- 模型更新范围：冻结 DiT 主干，仅更新 `BoltReferenceAttentionLayers`
 
 - 冻结 DiT 主干，仅训练参考注意力模块
 - 先在较小 `k_select` 和较低 candidate 数量下验证收敛
 - 每轮固定验证脚本记录关键指标，避免“看起来变好但不可复现”
+
+### 5.2 LongMemory / Codebook 的训练状态
+
+- `LongMemory` 和 `Codebook` 当前只嵌入在推理路径中（`infer_helios_bolt.py`）
+- 训练阶段不对 LongMemory 或 Codebook 参数做学习更新
+- 训练时主要优化的是 Ref-Attn 本身，LongMemory 作为推理时检索增强模块使用
 
 ---
 

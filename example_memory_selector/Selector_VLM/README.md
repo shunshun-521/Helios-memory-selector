@@ -3,7 +3,12 @@
 本目录主要放两类内容：
 
 - `example/`、`example_long/`：处理好的示例产物
-- `tools/offload_data/build_metadata.py`：从 `videos/*.mp4` 构建 `metadata.json` 的入口脚本
+- `tools/offload_data/build_metadata_minimal.py`：从 `videos/*.mp4` 构建 `metadata.json` 的脚本
+
+说明：
+
+- 目前只保留 `build_metadata_minimal.py`；
+- 流程固定为“TransNetV2 分镜 + Qwen3-VL visual_batch 写段落 prompt”。
 
 当前脚本保留的唯一路径：
 
@@ -58,7 +63,7 @@ from transnetv2_pytorch import TransNetV2
 
 ```bash
 conda activate helios
-python /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/tools/offload_data/build_metadata.py \
+python /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/tools/offload_data/build_metadata_minimal.py \
   --videos_dir /root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change/videos \
   --out_json /root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change/metadata.json \
   --seg_method scenedetect \
