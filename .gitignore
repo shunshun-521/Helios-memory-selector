@@ -41,3 +41,14 @@ bpe_simple_vocab_16e6.txt
 Videoreward
 1_formal_ckpts
 demo_data
+
+# User-specified local exclusions for collaboration upload
+data/
+output_*/
+zishun/
+ablation_*/
+
+# Keep only two core design docs under md/
+md/*
+!md/CLIP-base-selector-vlm.md
+!md/LongMemory.md
