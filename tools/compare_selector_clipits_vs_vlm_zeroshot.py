@@ -122,6 +122,12 @@ def parse_args():
         help="Use full chunk frames (multi-image) for VLM scoring instead of middle-frame only.",
     )
     p.add_argument(
+        "--vlm_single_frame_position",
+        choices=["middle", "first", "last"],
+        default="middle",
+        help="When NOT using --vlm_use_chunk_video, choose which frame represents each chunk for VLM scoring.",
+    )
+    p.add_argument(
         "--vlm_video_max_frames",
         type=int,
         default=None,
@@ -212,9 +218,11 @@ def main():
         print(f"[video] {uttid}  num_chunks={num_chunks}")
 
         # Precompute per-chunk:
-        # - decoded_middle_frames: middle frame for CLIP+ITS / legacy VLM scoring
+        # - decoded_middle_frames: middle frame for CLIP+ITS (kept fixed)
+        # - decoded_vlm_frames: single-frame representation for VLM (middle/first/last)
         # - decoded_chunk_videos: full chunk frames for video-level VLM scoring (optional)
         decoded_middle_frames = []
+        decoded_vlm_frames = []
         decoded_chunk_videos = []
         clip_feats = []
         for ci in range(num_chunks):
@@ -228,7 +236,7 @@ def main():
             decoded_middle_frames.append(pil)
             vf = clip_model.extract_visual_features([pil]).squeeze(0)
             clip_feats.append(vf.detach().cpu())
-            if args.vlm_use_chunk_video:
+            if args.vlm_use_chunk_video or args.vlm_single_frame_position in {"first", "last"}:
                 chunk_frames = decode_all_frames(
                     chunk_latent,
                     vae,
@@ -237,8 +245,15 @@ def main():
                     max_frames=args.vlm_video_max_frames,
                 )
                 decoded_chunk_videos.append(chunk_frames)
+                if args.vlm_single_frame_position == "first":
+                    decoded_vlm_frames.append(chunk_frames[0] if len(chunk_frames) > 0 else pil)
+                elif args.vlm_single_frame_position == "last":
+                    decoded_vlm_frames.append(chunk_frames[-1] if len(chunk_frames) > 0 else pil)
+                else:
+                    decoded_vlm_frames.append(pil)
             else:
                 decoded_chunk_videos.append(None)
+                decoded_vlm_frames.append(pil)
 
         if args.vlm_use_chunk_video and len(decoded_chunk_videos) > 0:
             first_len = len(decoded_chunk_videos[0]) if decoded_chunk_videos[0] is not None else 0
@@ -246,6 +261,8 @@ def main():
                 f"[video-mode] enabled  max_frames={args.vlm_video_max_frames}  "
                 f"frames_per_chunk(example)={first_len}"
             )
+        else:
+            print(f"[single-frame-mode] vlm_single_frame_position={args.vlm_single_frame_position}")
 
         if args.choice_mode == "all":
             choice_indices = list(range(0, num_chunks))
@@ -305,8 +322,8 @@ def main():
                         prompt=prompt,
                     )
                 else:
-                    candidate_imgs = [decoded_middle_frames[i] for i in gap_abs]
-                    context_img = decoded_middle_frames[context_idx]
+                    candidate_imgs = [decoded_vlm_frames[i] for i in gap_abs]
+                    context_img = decoded_vlm_frames[context_idx]
                     vlm_scores = vlm.score(context_image=context_img, candidate_images=candidate_imgs, prompt=prompt)
                 if args.vlm_rank_mode == "topk":
                     order = np.argsort(-vlm_scores)[:k]
