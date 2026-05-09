@@ -2,135 +2,90 @@
 
 本仓库基于 [Helios 原版](https://github.com/PKU-YuanGroup/Helios)，我们在其基础上实现了一个面向长视频一致性的改进方案：
 
-- `VLM Selector`：用于语义级参考帧选择（替代/增强 CLIP+ITS）
-- `LongMemory`：按需唤醒的长程记忆机制
-- `Codebook`：在线更新的视觉原型库（cut-gated 检索）
+- `VLM Selector`：用于选择参考的GAP历史帧作为condition注入
+- `LongMemory`：按需唤醒的长程记忆机制，会从codebook中利用VLM selector来选帧
+- `Codebook`：根据最近生成的chunk的最后一帧，与上一个chunk的中间帧的DINOv2 embedding的点积，决定相似度。
 
-目标是让模型在长时段生成中更稳定地保持人物、场景和语义连续性，同时控制推理开销。
-
----
-
-## 1. 项目定位
-
-- **上游基线**：Helios 官方实现（14B 实时长视频生成）
-- **我们的增量改动**：不改主干 DiT 训练范式，重点改造参考检索与记忆路径
-- **核心价值**：
-  - 长视频段间切换时减少漂移
-  - 在语义突变场景下提升参考帧命中质量
-  - 保持工程可插拔：可回退到原始 CLIP+ITS
+目标是让模型在Helios的stage 1阶段（将双向变化为单向AR diffusion模型并学习历史依赖）的训练能够训练出ref-attn，使得长时段推理生成中利用参考的condition更稳定地保持人物、场景和语义连续性，同时利用codebook控制推理开销。值得注意的是，**vlm选帧**、**codebook的refresh和insert**和**longmemory检索机制的启动**都不是训练得来的，而是通过各种方式验证其有效得来的。
 
 ---
 
-## 2. 方法概览
+## 1. 仓库中的关键文件
 
-### 2.1 VLM Selector（语义精排）
 
-- 在候选历史帧上，先做粗筛，再用 VLM 打分精排
-- 输出接口保持与原 `select_gap_frames` 一致：`(selected_latents, selected_indices)`
-- 支持两种策略：
-  - `its`：概率采样（与原 CLIP+ITS 习惯一致）
-  - `topk`：确定性选择（更利于复现）
-
-对应设计文档：`md/CLIP-base-selector-vlm.md`
-
-### 2.2 LongMemory + Codebook（按需检索）
-
-- 用 chunk 边界信号判断是否发生“明显切换”
-- 非切换时走短程记忆，切换时才触发全局 codebook 检索
-- codebook 按相似度进行 `merge / insert` 在线更新，支持容量控制
-
-对应设计文档：`md/LongMemory.md`
-
----
-
-## 3. 仓库中的关键文件
-
-- 推理入口：`infer_helios_bolt.py`
 - Ref-Attn 训练：`train_helios_bolt.py`
+- Ref-Attn 训练脚本： `scripts/training/train_bolt.sh`
+- Ref-Attn 训练配置示例：`scripts/training/configs/bolt_ref_attn.yaml`
+
 - VLM 选帧模块：`helios/modules/select_frames_vlm.py`
-- 长记忆模块：`helios/modules/long_memory.py`
-- codebook/记忆管理：`helios/modules/memory_bank.py`
-- 训练配置示例：`scripts/training/configs/bolt_ref_attn.yaml`
+- VLM 选帧模块的设计（包含CLIP+ITS的粗粒度选帧方法）：`md/CLIP-base-selector-vlm.md` （待修改查验）
+
+- LongMemory记忆检索启动模块：`helios/modules/long_memory.py`
+- codebook：`helios/modules/memory_bank.py`
+- LongMemory 和 codebook 的模块设计： `/root/autodl-tmp/Helios/md/LongMemory.md`（待修改查验）
+
+- 推理入口（利用已训好的Ref-Attn权重和Helios stage 1的权重推理）：`infer_helios_bolt.py`
+
+- 我们构建训练集的pipeline全流程：`example_memory_selector/README.md`
+
+- 【治宇】：`lm_tau_cut.md`
+- 【虎威】：`vlm_competence_benchmark.md`
+
 
 ---
 
-## 4. 快速开始（团队协作最小流程）
-
-### 4.1 环境准备
+## 1. 快速开始
+数据集在https://huggingface.co/datasets/shunshun-521/seedance-zip
+### 1.1 环境准备
 
 ```bash
-conda create -n helios_lmc python=3.11 -y
-conda activate helios_lmc
+# 1. Create conda environment
+conda create -n helios python=3.11.2 -y
+conda activate helios
 bash install.sh
+
+# 2. Install PyTorch (adjust for your CUDA version)
+# CUDA 12.6
+pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu126
+# CUDA 12.8
+pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+# CUDA 13.0
+pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu130
+
+# 3. Install dependencies
+bash install.sh
+
+# 4. Download models 由于我们的训练只用到stage1，所以只下载base的权重
+pip install modelscope
+modelscope download BestWishYSH/Helios-Base --local_dir BestWishYSH/Helios-Base
 ```
 
-### 4.2 基础推理（先确认主干可跑）
+### 1.2 基础Helios推理（先确认主干可跑）
 
 ```bash
 bash scripts/inference/helios-base_t2v.sh
 ```
 
-### 4.3 开启 VLM + LongMemory 路径（示例）
+interactive式推理
+```bash
+bash scripts/inference/experiment_interactive/helios-base_t2v.sh
+```
+
+### 1.3 Ref-Attn 的训练与推理 （小实验不涉及）
+
+```bash
+bash scripts/training/train_bolt.sh
+```
 
 请参考：
 
 - `infer_helios_bolt.py` 的 selector / long memory 参数
 - `scripts/training/configs/bolt_ref_attn.yaml` 中 `selector_training` 与 `selector_inference` 配置
 
-建议先用小样本视频做 smoke test，再逐步扩展到完整评估集。
+
 
 ---
 
-## 5. 训练建议
 
-### 5.1 Bolt Ref-Attn 训练（当前唯一训练路径）
 
-- 训练入口：`scripts/training/train_bolt.sh`
-- 配置入口：`scripts/training/configs/bolt_ref_attn.yaml`
-- 训练机制：每个 step 采样一个 `chunk_idx`（target chunk），并使用该 chunk 对应段落的 caption/prompt 作为条件进行优化
-- 模型更新范围：冻结 DiT 主干，仅更新 `BoltReferenceAttentionLayers`
-
-- 冻结 DiT 主干，仅训练参考注意力模块
-- 先在较小 `k_select` 和较低 candidate 数量下验证收敛
-- 每轮固定验证脚本记录关键指标，避免“看起来变好但不可复现”
-
-### 5.2 LongMemory / Codebook 的训练状态
-
-- `LongMemory` 和 `Codebook` 当前只嵌入在推理路径中（`infer_helios_bolt.py`）
-- 训练阶段不对 LongMemory 或 Codebook 参数做学习更新
-- 训练时主要优化的是 Ref-Attn 本身，LongMemory 作为推理时检索增强模块使用
-
----
-
-## 6. 协作规范（建议）
-
-- 分支命名：
-  - `feat/vlm-selector-*`
-  - `feat/long-memory-*`
-  - `exp/*`（临时实验）
-- 提交信息建议：
-  - `feat: add cut-gated codebook retrieval`
-  - `fix: align selector output signature with clip_its`
-  - `chore: clean unused logs and tmp artifacts`
-- PR 必须包含：
-  - 改动动机
-  - 关键实验设置
-  - 最小可复现命令
-  - 对比结果（至少 1 个 baseline）
-
----
-
-## 7. 上传 GitHub 前检查清单
-
-- [ ] 删除/忽略训练日志、大体积中间产物、临时脚本
-- [ ] 路径去本地化（不要包含个人机器绝对路径）
-- [ ] 配置里敏感信息脱敏
-- [ ] `README` 中提供可直接运行的最小命令
-- [ ] 至少完成一次从空环境到推理成功的自测
-
----
-
-## 8. 致谢
-
-感谢 Helios 原作者团队开源高质量基线。我们在其基础上进行研究性改进，欢迎 issue / PR 交流与共建。
 
