@@ -7,6 +7,9 @@
 
 ## 1. 你手里的数据和它们分别做什么
 
+我们目前的300条数据集，注意360度旋转一般没有切镜，只有aba和light_change会有，huggingface链接如下：
+https://huggingface.co/datasets/shunshun-521/seedance-zip
+
 - 视频目录（示例）：`/root/autodl-tmp/seedance/video_aba/videos/sample_00002.mp4`
 - 元数据：`/root/autodl-tmp/Selector_VLM/example_long/metadata_sample.jsonl`
 - 预处理后的 latent（`.pt`）

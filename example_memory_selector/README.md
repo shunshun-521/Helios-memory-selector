@@ -84,7 +84,7 @@ python /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/tools/offloa
 
 ---
 
-## 4. Step C: 生成 `latents_short`（用于训练）
+## 4. Step C: 把MP4文件生成 `latents_short`（用于训练）
 
 当 `metadata.json` 准备好后，可以用 `Helios/tools/offload_data/get_short-latents.sh/.py` 把视频离线编码成 `latents_short/*.pt`。
 
@@ -93,26 +93,15 @@ python /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/tools/offloa
 ```bash
 cd /root/autodl-tmp/Helios
 CONDA_ENV_NAME=helios \
-JSON_FILE=/root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change/metadata.json \
-VIDEO_FOLDER=/root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change \
-OUTPUT_LATENT_FOLDER=/root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/example_long/latents_short \
+JSON_FILE=/root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_360/metadata.json \
+VIDEO_FOLDER=/root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_360 \
+OUTPUT_LATENT_FOLDER=/root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_360/latents_short \
 STRIDE=1 BATCH_SIZE=4 RESOLUTION=640 \
-bash tools/offload_data/get_short-latents.sh
+bash /root/autodl-tmp/Helios/tools/offload_data/get_short-latents.sh
 ```
 
 > 关键点：`VIDEO_FOLDER` 要指向包含 `videos/` 子目录的根目录，因为 `metadata.json` 里 `path` 是 `videos/*.mp4` 相对路径。
 
-### 4.2 用 python 脚本直跑（等价）
-
-```bash
-cd /root/autodl-tmp/Helios
-torchrun --nproc_per_node 1 tools/offload_data/get_short-latents.py \
-  --pretrained_model_name_or_path /root/autodl-fs/BestWishYSH/Helios-Base \
-  --json_file /root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change/metadata.json \
-  --video_folder /root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change \
-  --output_latent_folder /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/example_long/latents_short \
-  --stride 1 --batch_size 4 --resolution 640
-```
 
 输出结果：
 
