@@ -64,8 +64,8 @@ from transnetv2_pytorch import TransNetV2
 ```bash
 conda activate helios
 python /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/tools/offload_data/build_metadata_minimal.py \
-  --videos_dir /root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change/videos \
-  --out_json /root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change/metadata.json \
+  --videos_dir /root/autodl-tmp/Helios/example_memory_selector/seedance/video_aba/videos \
+  --out_json /root/autodl-tmp/Helios/example_memory_selector/seedance/video_aba/metadata.json \
   --seg_method scenedetect \
   --prompt_mode qwen_vl \
   --qwen_vl_prompt_source visual_batch \

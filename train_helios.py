@@ -1,14 +1,16 @@
 import os
 
 
-os.environ["HF_ENABLE_PARALLEL_LOADING"] = "yes"
-os.environ["HF_PARALLEL_LOADING_WORKERS"] = "8"
+# Allow launcher scripts to override HF loading behavior to avoid stalls on shared storage.
+os.environ.setdefault("HF_ENABLE_PARALLEL_LOADING", "yes")
+os.environ.setdefault("HF_PARALLEL_LOADING_WORKERS", "8")
 
 import argparse
 import copy
 import json
 import logging
 import math
+import multiprocessing
 import random
 import shutil
 from datetime import timedelta
@@ -64,6 +66,7 @@ from helios.utils.utils_helios_post import (
 )
 from helios.utils.utils_recycle_batch import get_timesteps
 from helios.videoalign.inference import VideoVLMRewardInference
+from omegaconf import OmegaConf
 from packaging import version
 from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
@@ -106,6 +109,57 @@ logger = get_logger(__name__)
 
 if is_torch_npu_available():
     torch.npu.config.allow_internal_format = False
+
+
+def _build_validation_jobs(args):
+    val_prompts = args.validation_config.validation_prompts or []
+    if not val_prompts:
+        return []
+
+    id_token = args.data_config.id_token
+    use_interpolate_prompt = args.validation_config.use_interpolate_prompt and len(val_prompts) > 1
+
+    if use_interpolate_prompt:
+        interpolation_steps = args.validation_config.interpolation_steps
+        interpolate_time_list = list(args.validation_config.interpolate_time_list)
+        if not interpolate_time_list:
+            interpolate_time_list = [args.validation_config.interpolate_time] * len(val_prompts)
+
+        if len(interpolate_time_list) != len(val_prompts):
+            raise ValueError(
+                "validation_config.interpolate_time_list length must match validation_prompts length when "
+                "use_interpolate_prompt=True."
+            )
+        if min(interpolate_time_list) <= interpolation_steps:
+            raise ValueError(
+                f"Every interpolate_time value must be > interpolation_steps. "
+                f"Got interpolate_time_list={interpolate_time_list}, interpolation_steps={interpolation_steps}."
+            )
+
+        prompt_input = [id_token + prompt for prompt in val_prompts]
+        prompt_for_log = " | ".join(val_prompts)
+        return [
+            {
+                "prompt_input": prompt_input,
+                "prompt_for_log": prompt_for_log,
+                "pipe_kwargs_extra": {
+                    "use_interpolate_prompt": True,
+                    "interpolation_steps": interpolation_steps,
+                    "interpolate_time_list": interpolate_time_list,
+                },
+            }
+        ]
+
+    jobs = []
+    for prompt in val_prompts:
+        jobs.append(
+            {
+                "prompt_input": id_token + prompt,
+                "prompt_for_log": prompt,
+                "pipe_kwargs_extra": {},
+            }
+        )
+    return jobs
 
 
 def main(args):
@@ -187,7 +241,12 @@ def main(args):
             with open(config_path, "r") as f:
                 existing_conf = json.load(f)
 
-            ignore_keys = {"training_config.local_rank"}
+            ignore_keys = {
+                "training_config.local_rank",
+                # Resume control flags can legitimately differ between runs.
+                "training_config.resume_from_checkpoint",
+                "validation_config.first_step_valid",
+            }
             mismatches = compare_configs(existing_conf, current_conf, ignore_keys=ignore_keys)
             if mismatches:
                 print("Config mismatches found:")
@@ -257,7 +316,8 @@ def main(args):
         )
         noise_scheduler_copy = copy.deepcopy(noise_scheduler)
     else:
-        noise_scheduler = UniPCMultistepScheduler.from_pretrained("scripts/accelerate_configs/scheduler_config.json")
+        scheduler_cfg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "accelerate_configs")
+        noise_scheduler = UniPCMultistepScheduler.from_pretrained(scheduler_cfg_dir)
         noise_scheduler_copy = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
         if args.training_config.is_train_dmd:
             noise_scheduler.config.flow_shift = args.training_config.dmd_timestep_shift
@@ -423,6 +483,11 @@ def main(args):
             if trainable_module_name in name:
                 param.requires_grad = True
                 break
+
+    if args.training_config.use_ref_short:
+        from helios.utils.utils_helios_ref_short import init_patch_ref_trainable
+
+        init_patch_ref_trainable(transformer, args)
 
     if args.training_config.use_ema:
         model_cls = HeliosTransformer3DModel
@@ -764,12 +829,15 @@ def main(args):
             ]
         ), "Invalid dataset config: at least one of `gan_folders`, `ode_folders`, or `text_folders` must be non-empty."
     elif args.data_config.use_stage1_dataset:
+        shared_epoch = multiprocessing.Value("i", 0)
         dataset_kwargs = {
             "feature_folders": args.data_config.instance_data_root,
             "single_res": args.data_config.single_res,
             "single_height": args.data_config.single_height,
             "single_width": args.data_config.single_width,
-            "return_prompt_raw": args.training_config.is_use_reward_model,
+            "return_prompt_raw": args.training_config.is_use_reward_model
+            or args.training_config.use_ref_short,
+            "return_vae_latent_for_ref": args.training_config.use_ref_short,
             "return_all_vae_latent": (
                 args.training_config.dmd_teacher_forcing and args.training_config.dmd_teacher_forcing_ratio > 0
             )
@@ -778,6 +846,7 @@ def main(args):
             "is_keep_x0": True,
             "force_rebuild": args.data_config.force_rebuild,
             "seed": args.seed,
+            "shared_epoch": shared_epoch,
         }
     else:
         raise NotImplementedError
@@ -1103,6 +1172,30 @@ def main(args):
 
     accelerator.wait_for_everyone()
 
+    ref_short_latents_mean = None
+    ref_short_latents_std = None
+    if args.training_config.use_ref_short and args.data_config.use_stage1_dataset:
+        from helios.modules.extract_feature import CLIP
+        from helios.utils.ref_short_training import setup_ref_short_training
+
+        ref_short_clip_model = CLIP(device=str(accelerator.device))
+        ref_short_latents_mean = (
+            torch.tensor(vae.config.latents_mean).view(1, vae.config.z_dim, 1, 1, 1).to(accelerator.device)
+        )
+        ref_short_latents_std = (
+            1.0 / torch.tensor(vae.config.latents_std).view(1, vae.config.z_dim, 1, 1, 1).to(accelerator.device)
+        )
+        setup_ref_short_training(
+            args,
+            clip_model=ref_short_clip_model,
+            vae=vae,
+            latents_mean=ref_short_latents_mean,
+            latents_std=ref_short_latents_std,
+            device=str(accelerator.device),
+            dtype=weight_dtype,
+        )
+        accelerator.wait_for_everyone()
+
     prof = None
     if args.training_config.profile_out_dir is not None:
         prof = torch.profiler.profile(
@@ -1149,6 +1242,8 @@ def main(args):
                 latents_history_short = None
                 latents_history_mid = None
                 latents_history_long = None
+                latents_history_ref = None
+                indices_latents_history_ref = None
                 gan_vae_latents = None
                 gan_prompt_embeds = None
                 ode_latents = None
@@ -1219,6 +1314,21 @@ def main(args):
                     # Prepare prompt embeds
                     prompt_embeds = batch["prompt_embeds"].to(accelerator.device)
 
+                    _choice_log_every = int(os.environ.get("HELIOS_LOG_CHOICE_IDX_EVERY", "10"))
+                    if (
+                        accelerator.is_main_process
+                        and _choice_log_every > 0
+                        and step % _choice_log_every == 0
+                        and "choice_idx" in batch
+                    ):
+                        logger.info(
+                            "stage1 choice_idx epoch=%s step=%s choice_idx=%s uttid=%s",
+                            epoch,
+                            step,
+                            batch["choice_idx"],
+                            batch.get("uttid"),
+                        )
+
                     # Prepare stage1 clean data
                     history_latents = batch["history_latents"].to(accelerator.device)
                     target_latents = batch["target_latents"].to(accelerator.device)
@@ -1244,7 +1354,42 @@ def main(args):
                         is_keep_x0=True,
                         dtype=weight_dtype,
                         device=accelerator.device,
+                        use_ref_short_rope_shift=False,
                     )
+                    if args.training_config.use_ref_short:
+                        from helios.utils.ref_short_training import attach_ref_short_to_stage1_batch
+
+                        if next(vae.parameters()).device.type == "cpu":
+                            vae.to(accelerator.device, non_blocking=True)
+                        (
+                            model_input,
+                            indices_hidden_states,
+                            indices_latents_history_short,
+                            indices_latents_history_mid,
+                            indices_latents_history_long,
+                            latents_history_short,
+                            latents_history_mid,
+                            latents_history_long,
+                            latents_history_ref,
+                            indices_latents_history_ref,
+                            _selector_output,
+                        ) = attach_ref_short_to_stage1_batch(
+                            args,
+                            batch=batch,
+                            model_input=model_input,
+                            indices_hidden_states=indices_hidden_states,
+                            indices_latents_history_short=indices_latents_history_short,
+                            indices_latents_history_mid=indices_latents_history_mid,
+                            indices_latents_history_long=indices_latents_history_long,
+                            latents_history_short=latents_history_short,
+                            latents_history_mid=latents_history_mid,
+                            latents_history_long=latents_history_long,
+                            weight_dtype=weight_dtype,
+                            device=accelerator.device,
+                            vae=vae,
+                            latents_mean=ref_short_latents_mean,
+                            latents_std=ref_short_latents_std,
+                        )
                     history_latents = None
                     target_latents = None
                     x0_latents = None
@@ -1294,6 +1439,14 @@ def main(args):
                     latents_history_long = latents_history_long.to(
                         device=accelerator.device, dtype=weight_dtype, non_blocking=True
                     )
+                    if latents_history_ref is not None:
+                        latents_history_ref = latents_history_ref.to(
+                            device=accelerator.device, dtype=weight_dtype, non_blocking=True
+                        )
+                    if indices_latents_history_ref is not None:
+                        indices_latents_history_ref = indices_latents_history_ref.to(
+                            accelerator.device, non_blocking=True
+                        )
                 if prompt_embeds is not None:
                     prompt_embeds = prompt_embeds.to(accelerator.device, non_blocking=True)
 
@@ -1374,6 +1527,8 @@ def main(args):
                         latents_history_short=latents_history_short,
                         latents_history_mid=latents_history_mid,
                         latents_history_long=latents_history_long,
+                        latents_history_ref=latents_history_ref,
+                        indices_latents_history_ref=indices_latents_history_ref,
                         recycle_vars=recycle_vars,
                         global_step=global_step,
                         noise_scheduler_copy=noise_scheduler_copy,
@@ -2148,11 +2303,41 @@ def main(args):
                                 torch_dtype=weight_dtype,
                             )
 
+                            ref_short_val_ctx = None
+                            if args.training_config.use_ref_short:
+                                from helios.modules.extract_feature import CLIP
+                                from helios.utils.ref_short_validation import build_validation_ctx
+
+                                val_clip = CLIP(device=str(accelerator.device))
+                                val_latents_mean = (
+                                    torch.tensor(vae.config.latents_mean)
+                                    .view(1, vae.config.z_dim, 1, 1, 1)
+                                    .to(accelerator.device)
+                                )
+                                val_latents_std = (
+                                    1.0
+                                    / torch.tensor(vae.config.latents_std)
+                                    .view(1, vae.config.z_dim, 1, 1, 1)
+                                    .to(accelerator.device)
+                                )
+                                ref_short_val_ctx = build_validation_ctx(
+                                    args,
+                                    clip_model=val_clip,
+                                    vae=vae,
+                                    latents_mean=val_latents_mean,
+                                    latents_std=val_latents_std,
+                                    device=accelerator.device,
+                                    dtype=weight_dtype,
+                                )
+
                             all_videos = []
                             all_prompts = []
-                            for validation_prompt in args.validation_config.validation_prompts:
+                            validation_jobs = _build_validation_jobs(args)
+                            for val_job in validation_jobs:
+                                if ref_short_val_ctx is not None:
+                                    ref_short_val_ctx.reset()
                                 pipeline_args = {
-                                    "prompt": args.data_config.id_token + validation_prompt,
+                                    "prompt": val_job["prompt_input"],
                                     "negative_prompt": "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
                                     "guidance_scale": args.validation_config.validation_guidance_scale,
                                     "num_frames": args.validation_config.validation_max_num_frames,
@@ -2174,12 +2359,16 @@ def main(args):
                                     "use_dmd": args.training_config.is_train_dmd,
                                     "is_amplify_first_chunk": args.training_config.is_amplify_first_chunk,
                                 }
+                                if ref_short_val_ctx is not None:
+                                    pipeline_args["ref_short_validation_ctx"] = ref_short_val_ctx
+                                pipeline_args.update(val_job["pipe_kwargs_extra"])
 
                                 videos, prompt = log_validation(
                                     pipe=pipe,
                                     args=args,
                                     accelerator=accelerator,
                                     pipeline_args=pipeline_args,
+                                    prompt_for_log=val_job["prompt_for_log"],
                                 )
 
                                 all_videos.extend(videos)
@@ -2361,9 +2550,10 @@ def main(args):
 
                 all_videos = []
                 all_prompts = []
-                for validation_prompt in args.validation_config.validation_prompts:
+                validation_jobs = _build_validation_jobs(args)
+                for val_job in validation_jobs:
                     pipeline_args = {
-                        "prompt": args.data_config.id_token + validation_prompt,
+                        "prompt": val_job["prompt_input"],
                         "negative_prompt": "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
                         "guidance_scale": args.validation_config.validation_guidance_scale,
                         "num_frames": args.validation_config.validation_max_num_frames,
@@ -2385,11 +2575,13 @@ def main(args):
                         "use_dmd": args.training_config.is_train_dmd,
                         "is_amplify_first_chunk": args.training_config.is_amplify_first_chunk,
                     }
+                    pipeline_args.update(val_job["pipe_kwargs_extra"])
                     videos, prompt = log_validation(
                         pipe=pipe,
                         args=args,
                         accelerator=accelerator,
                         pipeline_args=pipeline_args,
+                        prompt_for_log=val_job["prompt_for_log"],
                     )
 
                     all_videos.extend(videos)
@@ -2419,9 +2611,17 @@ def log_validation(
     args,
     accelerator,
     pipeline_args,
+    prompt_for_log=None,
 ):
+    resolved_prompt_for_log = prompt_for_log
+    if resolved_prompt_for_log is None:
+        if isinstance(pipeline_args["prompt"], str):
+            resolved_prompt_for_log = pipeline_args["prompt"]
+        else:
+            resolved_prompt_for_log = "interactive_prompt"
+
     logger.info(
-        f"Running validation... \n Generating {args.validation_config.num_validation_videos} videos with prompt: {pipeline_args['prompt']}."
+        f"Running validation... \n Generating {args.validation_config.num_validation_videos} videos with prompt: {resolved_prompt_for_log}."
     )
 
     pipe = pipe.to(accelerator.device)
@@ -2437,7 +2637,7 @@ def log_validation(
     del pipe
     free_memory()
 
-    return videos, pipeline_args["prompt"]
+    return videos, resolved_prompt_for_log
 
 
 if __name__ == "__main__":

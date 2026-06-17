@@ -62,7 +62,7 @@ length_bucket_options = {
     2: [193, 177, 161, 156, 145, 133, 129, 121, 113, 109, 97, 85, 81, 73, 65, 61, 49, 37, 25],
 }
 
-
+# 动态分桶机制 找最适合宽高
 def find_nearest_resolution_bucket(h, w, resolution=640):
     min_metric = float("inf")
     best_bucket = None
@@ -73,7 +73,7 @@ def find_nearest_resolution_bucket(h, w, resolution=640):
             best_bucket = (bucket_h, bucket_w)
     return best_bucket
 
-
+# 动态分桶机制 找合适帧数（长度）
 def find_nearest_length_bucket(length, stride=1):
     buckets = length_bucket_options[stride]
     min_bucket = min(buckets)
@@ -230,21 +230,48 @@ class BucketedFeatureDataset(Dataset):
                     existing_videos.add(rel_path)
         print(f"Found {len(existing_videos)} video files")
 
-        df = pd.DataFrame(
-            [
+        # Support both Helios native metadata format and Selector_VLM chunk-aligned metadata.
+        # - Helios format requires: cut/crop/cap
+        # - Selector_VLM format may only provide: id/path/fps/num_frames/resolution/segments
+        rows = []
+        for item in data:
+            res = item.get("resolution", {}) or {}
+            width = int(res.get("width", item.get("width", 0)) or 0)
+            height = int(res.get("height", item.get("height", 0)) or 0)
+            num_frames = int(item.get("num_frames", 0) or 0)
+
+            cut = item.get("cut", None)
+            if cut is None:
+                cut = [0, num_frames]
+
+            crop = item.get("crop", None)
+            if crop is None:
+                crop = [0, width, 0, height]
+
+            segments = item.get("segments", None)
+            cap = item.get("cap", None)
+            if cap is None:
+                # Fallback caption: first segment prompt or empty string
+                if isinstance(segments, list) and len(segments) > 0:
+                    cap = [str(segments[0].get("prompt", "") or "")]
+                else:
+                    cap = [str(item.get("prompt", "") or "")]
+
+            rows.append(
                 {
-                    "cut": item["cut"],
-                    "crop": item["crop"],
-                    "path": item["path"],
-                    "num_frames": item["num_frames"],
-                    "width": item["resolution"]["width"],
-                    "height": item["resolution"]["height"],
-                    "fps": item["fps"],
-                    "cap": item["cap"],
+                    "cut": cut,
+                    "crop": crop,
+                    "path": item.get("path", ""),
+                    "num_frames": num_frames,
+                    "width": width,
+                    "height": height,
+                    "fps": float(item.get("fps", 0.0) or 0.0),
+                    "cap": cap,
+                    "segments": segments,
                 }
-                for item in data
-            ]
-        )
+            )
+
+        df = pd.DataFrame(rows)
 
         samples = []
         buckets = defaultdict(list)
@@ -285,6 +312,7 @@ class BucketedFeatureDataset(Dataset):
             height = crop[3] - crop[2]
 
             prompt = row["cap"][0]
+            segments = row.get("segments", None)
 
             # TODO need to be checked
             effective_num_frame = (num_frame + self.stride - 1) // self.stride
@@ -326,6 +354,8 @@ class BucketedFeatureDataset(Dataset):
                 "video_path": video_path,
                 "bucket_key": bucket_key,
                 "prompt": self.id_token + prompt,
+                # Optional: chunk-aligned segments from Selector_VLM metadata
+                "segments": segments,
                 "fps": fps,
                 "stride": stride,
                 "effective_num_frame": effective_num_frame,
@@ -409,7 +439,10 @@ class BucketedFeatureDataset(Dataset):
                         "effective_num_frame": sample_info["effective_num_frame"],
                     },
                     "videos": video_data,
+                    # NOTE: `prompts` is kept for backward compatibility (single caption).
+                    # If `segments` exists, we also return `prompt_segments` so preprocess can encode per-segment prompts.
                     "prompts": sample_info["prompt"],
+                    "prompt_segments": sample_info.get("segments", None),
                     "first_frames_images": (video_data[0] + 1) / 2 * 255,
                 }
             except Exception as e:

@@ -1,0 +1,17 @@
+CUDA_VISIBLE_DEVICES=0 python /root/autodl-tmp/Helios/infer_helios_ref_short.py \
+    --config "/root/autodl-tmp/Helios/scripts/inference/ref_short.yaml" \
+    --pretrained_model_name_or_path "/root/autodl-fs/BestWishYSH/Helios-Base" \
+    --transformer_model_name_or_path "/root/autodl-fs/output/ref_short_post_5_27_cro/checkpoint-1500/merged/transformer" \
+    --vlm_model_path "/root/autodl-fs/Qwen2.5-VL-3B-Instruct" \
+    --vlm_k_select 2 \
+    --ref_frames_per_chunk 3 \
+    --prompt "A sharp-dressed businessman in a charcoal three-piece suit, a pale blue pocket square folded into a perfect triangle, and a gold tie bar pinning a striped tie walks briskly across a sun-bleached plaza. The camera frames him from head to mid-thigh, his full upper body clearly visible — sharp jawline, slicked hair, confident expression. The pocket square is vivid. The gold tie bar glints sharply. The pinstripe of the suit is crisp in the hard light. He passes through a narrow concrete parking structure corridor. The fluorescent lights flicker and die midway — his silhouette is swallowed entirely, the suit's fine texture and pocket square dissolving into black, the gold tie bar gone. He strides out the other side into hard afternoon sun. The camera holds the same head-to-mid-thigh framing — his face catches the light first, then the pale blue pocket square blazes back into view. The gold tie bar glints sharply. The pinstripe of the suit snaps back into focus. He adjusts his cufflinks and walks on." \
+    --negative_prompt "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards" \
+    --height 384 \
+    --width 640 \
+    --num_frames 824 \
+    --num_inference_steps 50 \
+    --guidance_scale 5.0 \
+    --scheduler_type "unipc" \
+    --seed 42 \
+    --output_path "/root/autodl-fs/output/5_28/helios-ref_short_1500.mp4"

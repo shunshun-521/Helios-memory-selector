@@ -32,6 +32,7 @@ class DataConfig:
     single_width: int = field(default=640)
     single_length: bool = field(default=False)
     single_num_frame: int = field(default=81)
+    single_seq_len: int = field(default=400)
     multi_res: bool = field(default=False)
     caption_dropout_p: float = field(default=0.00)
     id_token: str = field(default="")
@@ -40,6 +41,7 @@ class DataConfig:
     )
     # ---- Stage 1 ----
     use_stage1_dataset: bool = field(default=False)
+    return_vae_latent_for_ref: bool = field(default=False)
     # ---- Stage 3 ----
     use_stage3_dataset: bool = field(default=False)
     gan_data_root: Optional[list] = field(default_factory=list)
@@ -100,6 +102,11 @@ class ValidationConfig:
     first_step_valid: bool = field(default=True)
     num_validation_videos: int = field(default=1)
     num_inference_steps: int = field(default=30)
+    # ---- Interactive prompt interpolation (validation only) ----
+    use_interpolate_prompt: bool = field(default=False)
+    interpolation_steps: int = field(default=1)
+    interpolate_time: int = field(default=3)
+    interpolate_time_list: list[int] = field(default_factory=list)
     # ---- Stage 1 ----
     use_kv_cache: bool = field(default=False)
     # ---- Stage 2 ----
@@ -215,11 +222,24 @@ class TrainingConfig:
     is_train_full_patch_embedding: bool = field(default=False)
     is_train_lora_patch_embedding: bool = field(default=False)
     zero_history_timestep: bool = field(default=False)
+    # ---- Ref-Short path ----
+    use_ref_short: bool = field(default=False)
+    ref_frames_per_chunk: int = field(default=3)
+    is_train_full_patch_ref: bool = field(default=False)
+    is_train_lora_patch_ref: bool = field(default=False)
     restrict_self_attn: bool = field(default=False)
     guidance_cross_attn: bool = field(default=False)
     is_train_restrict_lora: bool = field(default=False)
     restrict_lora: bool = field(default=False)
     restrict_lora_rank: int = field(default=128)
+    # ---- Selector Parameters ----
+    use_selector: bool = field(default=False)
+    selector_k_select: int = field(default=4)
+    selector_alpha: float = field(default=1.0)
+    selector_cross_frame_alpha: float = field(default=0.85)
+    selector_pos_power: float = field(default=1.8)
+    selector_pos_eta: float = field(default=0.4)
+    selector_dropout: float = field(default=0.3)
     # ---- Easy Anti-Drifting Parameters ----
     corrupt_model_input: bool = field(default=False)
     corrupt_mode_model_input: str = field(
@@ -421,6 +441,38 @@ class TrainingConfig:
 
 
 @dataclass
+class SelectorTrainingConfig:
+    selector_type: str = field(default="vlm")
+    selector_force_slow: bool = field(default=True)
+    vlm_k_select: int = field(default=2)
+    vlm_min_chunk_distance: int = field(default=3)
+    vlm_model_path: Optional[str] = field(default=None)
+    vlm_rank_mode: str = field(default="topk")
+    enable_long_memory: bool = field(default=False)
+    debug_log: bool = field(default=False)
+    debug_every: int = field(default=1)
+
+
+@dataclass
+class SelectorInferenceConfig:
+    selector_force_slow: bool = field(default=False)
+    enable_long_memory: bool = field(default=True)
+    vlm_k_select: int = field(default=2)
+    # Cap candidate history in full-slow inference.
+    # 0 means unlimited (no eviction).
+    slow_history_max_chunks: int = field(default=0)
+    dino_model_path: Optional[str] = field(default=None)
+    lm_tau_merge: float = field(default=0.85)
+    lm_tau_cut: float = field(default=0.35)
+    lm_ema_alpha_new: float = field(default=0.2)
+    lm_codebook_max_size: int = field(default=512)
+    lm_codebook_topm: int = field(default=16)
+    lm_codebook_evict: str = field(default="lru")
+    debug_log: bool = field(default=False)
+    debug_every: int = field(default=1)
+
+
+@dataclass
 class Args:
     output_dir: str = field(default="Helios")
     seed: int = field(default=42)
@@ -429,4 +481,6 @@ class Args:
     model_config: ModelConfig = field(default_factory=ModelConfig)
     validation_config: ValidationConfig = field(default_factory=ValidationConfig)
     training_config: TrainingConfig = field(default_factory=TrainingConfig)
+    selector_training: SelectorTrainingConfig = field(default_factory=SelectorTrainingConfig)
+    selector_inference: SelectorInferenceConfig = field(default_factory=SelectorInferenceConfig)
     logging_dir: str = field(default="logs")

@@ -41,8 +41,8 @@ python -c "from modelscope import snapshot_download; snapshot_download('Qwen/Qwe
 ```bash
 conda activate helios
 python /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/tools/offload_data/build_metadata_minimal.py \
-  --videos_dir /root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change/videos \
-  --out_json /root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change/metadata.json \
+  --videos_dir /root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_light_change/videos \
+  --out_json /root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_light_change/metadata.json \
   --seg_method scenedetect \
   --prompt_mode qwen_vl \
   --qwen_vl_prompt_source visual_batch \

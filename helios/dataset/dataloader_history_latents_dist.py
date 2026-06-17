@@ -17,17 +17,20 @@ class BucketedFeatureDataset(Dataset):
         force_rebuild=False,
         return_all_vae_latent=False,
         return_prompt_raw=False,
+        return_vae_latent_for_ref=False,
         num_rollout_sections=3,
         single_res=False,
         single_height=384,
         single_width=640,
         seed=42,
+        shared_epoch=None,
     ):
         self.history_sizes = history_sizes
         self.is_keep_x0 = is_keep_x0
         self.force_rebuild = force_rebuild
         self.return_all_vae_latent = return_all_vae_latent
         self.return_prompt_raw = return_prompt_raw
+        self.return_vae_latent_for_ref = return_vae_latent_for_ref
         self.num_rollout_sections = num_rollout_sections
         self.single_res = single_res
         self.single_height = single_height
@@ -36,6 +39,14 @@ class BucketedFeatureDataset(Dataset):
 
         self.base_seed = seed
         self._epoch = 0
+        self._shared_epoch = shared_epoch
+        self._debug_seg_prompt = os.environ.get("HELIOS_DEBUG_SEGMENT_PROMPT", "0").strip() not in {"", "0", "false", "False"}
+        try:
+            self._debug_every = int(os.environ.get("HELIOS_DEBUG_SEGMENT_PROMPT_EVERY", "200"))
+        except Exception:
+            self._debug_every = 200
+        self._debug_printed = 0
+        self._debug_max_prints = int(os.environ.get("HELIOS_DEBUG_SEGMENT_PROMPT_MAX", "50") or 50)
 
         if isinstance(feature_folders, str):
             self.feature_folders = [feature_folders]
@@ -129,6 +140,8 @@ class BucketedFeatureDataset(Dataset):
 
     def set_epoch(self, epoch):
         self._epoch = epoch
+        if self._shared_epoch is not None:
+            self._shared_epoch.value = epoch
 
     def prepare_stage1_latent(self, vae_latent, idx, base_vae_latent=None):
         source_latent = base_vae_latent if base_vae_latent is not None else vae_latent
@@ -163,7 +176,8 @@ class BucketedFeatureDataset(Dataset):
         )
         continue_vae_latent = torch.cat([zero_padding_vae, temp_vae_latent], dim=1)
 
-        sample_seed = self.base_seed + self._epoch * 1000000 + idx
+        epoch = self._shared_epoch.value if self._shared_epoch is not None else self._epoch
+        sample_seed = self.base_seed + epoch * 1000000 + idx
         choice_idx = torch.randint(
             0, total_sections, (1,), generator=torch.Generator().manual_seed(sample_seed)
         ).item()
@@ -188,7 +202,7 @@ class BucketedFeatureDataset(Dataset):
         history_latent = continue_source_latent[:, start_indice : start_indice + history_window_size, :, :]
         target_latent = continue_vae_latent[:, start_indice + history_window_size : end_indice, :, :]
 
-        return x0_latent, history_latent, target_latent, clean_all_vae_latent
+        return x0_latent, history_latent, target_latent, clean_all_vae_latent, choice_idx
 
     def __len__(self):
         return len(self.samples)
@@ -231,11 +245,53 @@ class BucketedFeatureDataset(Dataset):
                     base_vae_latent = torch.load(base_file_path, map_location="cpu", weights_only=False)["vae_latent"]
 
                 feature_data = torch.load(sample_info["file_path"], map_location="cpu", weights_only=False)
-                x0_latent, history_latent, target_latent, clean_all_vae_latent = self.prepare_stage1_latent(
+                x0_latent, history_latent, target_latent, clean_all_vae_latent, choice_idx = self.prepare_stage1_latent(
                     feature_data["vae_latent"], idx, base_vae_latent
                 )
+                # Select chunk-aligned prompt embedding if available
+                prompt_embed = feature_data.get("prompt_embed", None)
+                prompt_raw_selected = None
+                seg_idx_selected = None
+                seg_bounds_selected = None
+                if "prompt_embeds_by_segment" in feature_data and "segments" in feature_data:
+                    seg_embeds = feature_data["prompt_embeds_by_segment"]  # (N_seg, S, D)
+                    segs = feature_data["segments"]  # list[dict]
+                    seg_idx = 0
+                    for k, seg in enumerate(segs):
+                        sc = int(seg.get("start_chunk", 0) or 0)
+                        ec = int(seg.get("end_chunk", 0) or 0)
+                        if sc <= choice_idx < ec:
+                            seg_idx = k
+                            break
+                    prompt_embed = seg_embeds[seg_idx]
+                    prompt_raw_selected = str(segs[seg_idx].get("prompt_raw", "") or "")
+                    seg_idx_selected = int(seg_idx)
+                    seg_bounds_selected = (
+                        int(segs[seg_idx].get("start_chunk", 0) or 0),
+                        int(segs[seg_idx].get("end_chunk", 0) or 0),
+                    )
+
                 if self.return_prompt_raw:
-                    prompt_raws = feature_data["prompt_raw"]
+                    if prompt_raw_selected is not None:
+                        prompt_raws = prompt_raw_selected
+                    else:
+                        prompt_raws = feature_data.get("prompt_raw", "")
+
+                # Debug print (rate-limited): verify cross-attn conditioning matches segment prompt for choice_idx
+                if (
+                    self._debug_seg_prompt
+                    and seg_idx_selected is not None
+                    and (self._debug_printed < self._debug_max_prints)
+                    and (self._debug_every > 0)
+                    and (idx % self._debug_every == 0)
+                ):
+                    pr = (prompt_raw_selected or "").replace("\n", " ").strip()
+                    pr_snip = pr[:160] + ("..." if len(pr) > 160 else "")
+                    print(
+                        f"[DEBUG][seg-prompt] uttid={sample_info['uttid']} choice_idx={choice_idx} "
+                        f"seg_idx={seg_idx_selected} bounds={seg_bounds_selected} prompt='{pr_snip}'"
+                    )
+                    self._debug_printed += 1
                 break
             except Exception:
                 idx = random.randint(0, len(self.samples) - 1)
@@ -256,12 +312,16 @@ class BucketedFeatureDataset(Dataset):
             "history_latents": history_latent,
             "target_latents": target_latent,
             "clean_all_latents": clean_all_vae_latent,
-            "prompt_embeds": feature_data["prompt_embed"],
+            "prompt_embeds": prompt_embed,
             "prompt_attention_masks": feature_data.get("prompt_attention_mask", None),
+            "choice_idx": choice_idx,
         }
 
         if self.return_prompt_raw:
             output_dict["prompt_raws"] = prompt_raws
+
+        if self.return_vae_latent_for_ref:
+            output_dict["vae_latent"] = feature_data["vae_latent"]
 
         return output_dict
 

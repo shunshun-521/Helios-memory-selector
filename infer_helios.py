@@ -34,6 +34,43 @@ from diffusers.models import AutoencoderKLWan
 from diffusers.utils import export_to_video, load_image, load_video
 
 
+def _assign_parameter_by_name(module, param_name, new_tensor, requires_grad):
+    target = module
+    parts = param_name.split(".")
+    for part in parts[:-1]:
+        target = getattr(target, part)
+    setattr(target, parts[-1], torch.nn.Parameter(new_tensor, requires_grad=requires_grad))
+
+
+def materialize_meta_tensors(module, init_device="cpu"):
+    """
+    Materialize meta parameters/buffers so that module.to(device) won't fail.
+    This is needed when low_cpu_mem_usage loading leaves newly-added params on meta.
+    """
+    materialized = []
+    for name, param in list(module.named_parameters()):
+        if getattr(param, "is_meta", False):
+            tensor = torch.empty(param.shape, dtype=param.dtype, device=init_device)
+            if name.endswith("bias") or "scale_shift_table" in name:
+                torch.nn.init.zeros_(tensor)
+            else:
+                torch.nn.init.normal_(tensor, mean=0.0, std=0.02)
+            _assign_parameter_by_name(module, name, tensor, param.requires_grad)
+            materialized.append(name)
+
+    for name, buf in list(module.named_buffers()):
+        if getattr(buf, "is_meta", False):
+            target = module
+            parts = name.split(".")
+            for part in parts[:-1]:
+                target = getattr(target, part)
+            target._buffers[parts[-1]] = torch.zeros(buf.shape, dtype=buf.dtype, device=init_device)
+            materialized.append(name)
+
+    if materialized:
+        print(f"Materialized {len(materialized)} meta tensors: {materialized}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate video with model")
 
@@ -43,6 +80,12 @@ def parse_args():
         "--transformer_path",
         type=str,
         default="BestWishYsh/Helios-Base",
+    )
+    parser.add_argument(
+        "--scheduler_path",
+        type=str,
+        default=None,
+        help="Path to scheduler config. If None, uses base_model_path.",
     )
     parser.add_argument(
         "--lora_path",
@@ -96,6 +139,13 @@ def parse_args():
     parser.add_argument("--use_interpolate_prompt", action="store_true")
     parser.add_argument("--interpolation_steps", type=int, default=3)
     parser.add_argument("--interpolate_time", type=int, default=7)
+    parser.add_argument(
+        "--interpolate_time_list",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional explicit interactive interpolate time list, e.g. --interpolate_time_list 2 3 4.",
+    )
     parser.add_argument(
         "--image_path",
         type=str,
@@ -229,6 +279,7 @@ def main():
         subfolder="transformer",
         torch_dtype=args.weight_dtype,
     )
+    materialize_meta_tensors(transformer)
     if not args.enable_compile:
         transformer = replace_rmsnorm_with_fp32(transformer)
         transformer = replace_all_norms_with_flash_norms(transformer)
@@ -236,15 +287,19 @@ def main():
     try:
         transformer.set_attention_backend("_flash_3_hub")
     except Exception:
-        transformer.set_attention_backend("flash_hub")
+        try:
+            transformer.set_attention_backend("flash_hub")
+        except Exception:
+            print("Warning: Could not set flash attention backend, using default attention.")
 
     vae = AutoencoderKLWan.from_pretrained(
         args.base_model_path,
         subfolder="vae",
         torch_dtype=torch.float32,
     )
+    scheduler_path = args.scheduler_path or args.base_model_path
     scheduler = HeliosScheduler.from_pretrained(
-        args.base_model_path,
+        scheduler_path,
         subfolder="scheduler",
     )
     pipe = HeliosPipeline.from_pretrained(
@@ -256,7 +311,8 @@ def main():
     )
 
     if args.lora_path is not None:
-        pipe.load_lora_weights(args.lora_path, adapter_name="default")
+        # Avoid meta tensor leftovers from PEFT low_cpu_mem_usage path, which can break pipe.to(device).
+        pipe.load_lora_weights(args.lora_path, adapter_name="default", low_cpu_mem_usage=False)
         pipe.set_adapters(["default"], adapter_weights=[1.0])
 
         if args.partial_path is not None:
@@ -442,49 +498,60 @@ def main():
                 prompt_list = group_df["refined_prompt"].fillna(group_df["prompt"]).tolist()
             else:
                 prompt_list = group_df["prompt"].tolist()
-            interpolate_time_list = [args.interpolate_time] * len(prompt_list)
+            if args.interpolate_time_list is not None:
+                interpolate_time_list = list(args.interpolate_time_list)
+                if len(interpolate_time_list) != len(prompt_list):
+                    raise ValueError(
+                        "Length mismatch between prompts and interpolate_time_list: "
+                        f"{len(prompt_list)} vs {len(interpolate_time_list)}"
+                    )
+                if min(interpolate_time_list) <= args.interpolation_steps:
+                    raise ValueError(
+                        "Every interpolate_time value must be > interpolation_steps. "
+                        f"Got interpolate_time_list={interpolate_time_list}, "
+                        f"interpolation_steps={args.interpolation_steps}."
+                    )
+            else:
+                interpolate_time_list = [args.interpolate_time] * len(prompt_list)
 
             with torch.no_grad():
-                try:
-                    output = pipe(
-                        prompt=prompt_list,
-                        negative_prompt=args.negative_prompt,
-                        height=args.height,
-                        width=args.width,
-                        num_frames=args.num_frames,
-                        num_inference_steps=args.num_inference_steps,
-                        guidance_scale=args.guidance_scale,
-                        generator=torch.Generator(device="cuda").manual_seed(args.seed),
-                        # stage 1
-                        history_sizes=[16, 2, 1],
-                        num_latent_frames_per_chunk=args.num_latent_frames_per_chunk,
-                        keep_first_frame=True,
-                        # stage 2
-                        is_enable_stage2=args.is_enable_stage2,
-                        pyramid_num_inference_steps_list=args.pyramid_num_inference_steps_list,
-                        # stage 3
-                        is_skip_first_chunk=args.is_skip_first_chunk,
-                        is_amplify_first_chunk=args.is_amplify_first_chunk,
-                        # cfg zero
-                        use_zero_init=args.use_zero_init,
-                        zero_steps=args.zero_steps,
-                        # i2v
-                        image=load_image(image_path).resize((args.width, args.height))
-                        if image_path is not None
-                        else None,
-                        image_noise_sigma_min=args.image_noise_sigma_min,
-                        image_noise_sigma_max=args.image_noise_sigma_max,
-                        # v2v
-                        video=load_video(video_path) if video_path is not None else None,
-                        video_noise_sigma_min=args.video_noise_sigma_min,
-                        video_noise_sigma_max=args.video_noise_sigma_max,
-                        # interpolate_prompt
-                        use_interpolate_prompt=args.use_interpolate_prompt,
-                        interpolation_steps=args.interpolation_steps,
-                        interpolate_time_list=interpolate_time_list,
-                    ).frames[0]
-                except Exception:
-                    continue
+                output = pipe(
+                    prompt=prompt_list,
+                    negative_prompt=args.negative_prompt,
+                    height=args.height,
+                    width=args.width,
+                    num_frames=args.num_frames,
+                    num_inference_steps=args.num_inference_steps,
+                    guidance_scale=args.guidance_scale,
+                    generator=torch.Generator(device="cuda").manual_seed(args.seed),
+                    # stage 1
+                    history_sizes=[16, 2, 1],
+                    num_latent_frames_per_chunk=args.num_latent_frames_per_chunk,
+                    keep_first_frame=True,
+                    # stage 2
+                    is_enable_stage2=args.is_enable_stage2,
+                    pyramid_num_inference_steps_list=args.pyramid_num_inference_steps_list,
+                    # stage 3
+                    is_skip_first_chunk=args.is_skip_first_chunk,
+                    is_amplify_first_chunk=args.is_amplify_first_chunk,
+                    # cfg zero
+                    use_zero_init=args.use_zero_init,
+                    zero_steps=args.zero_steps,
+                    # i2v
+                    image=load_image(image_path).resize((args.width, args.height))
+                    if image_path is not None
+                    else None,
+                    image_noise_sigma_min=args.image_noise_sigma_min,
+                    image_noise_sigma_max=args.image_noise_sigma_max,
+                    # v2v
+                    video=load_video(video_path) if video_path is not None else None,
+                    video_noise_sigma_min=args.video_noise_sigma_min,
+                    video_noise_sigma_max=args.video_noise_sigma_max,
+                    # interpolate_prompt
+                    use_interpolate_prompt=args.use_interpolate_prompt,
+                    interpolation_steps=args.interpolation_steps,
+                    interpolate_time_list=interpolate_time_list,
+                ).frames[0]
             if not args.enable_parallelism or rank == 0:
                 export_to_video(output, output_path, fps=24)
     else:

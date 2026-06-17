@@ -7,7 +7,7 @@
   "disable_corrector": [],
   "dynamic_thresholding_ratio": 0.995,
   "final_sigmas_type": "zero",
-  "flow_shift": 3.0,
+  "flow_shift": 5.0,
   "lower_order_final": true,
   "num_train_timesteps": 1000,
   "predict_x0": true,

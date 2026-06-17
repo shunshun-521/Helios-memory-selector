@@ -39,6 +39,8 @@ def _flow_loss(
     global_step,
     noise_scheduler_copy,
     use_clean_input,
+    latents_history_ref=None,
+    indices_latents_history_ref=None,
 ):
     assert len(noisy_model_input_list) == len(sigmas_list) == len(timesteps_list) == len(targets_list)
 
@@ -57,6 +59,8 @@ def _flow_loss(
             latents_history_short=latents_history_short,  # torch.Size([2, 16, 2, 60, 104])
             latents_history_mid=latents_history_mid,  # torch.Size([2, 16, 2, 60, 104])
             latents_history_long=latents_history_long,  # torch.Size([2, 16, 16, 60, 104])
+            latents_history_ref=latents_history_ref,
+            indices_latents_history_ref=indices_latents_history_ref,
             return_dict=False,
         )[0]
 
@@ -618,6 +622,7 @@ def prepare_stage1_clean_input_from_latents(
     is_keep_x0: bool = True,
     dtype=torch.bfloat16,
     device="cpu",
+    use_ref_short_rope_shift: bool = False,
 ):
     if is_keep_x0:
         latents_prefix = x0_latents.to(device, dtype=dtype)
@@ -636,6 +641,10 @@ def prepare_stage1_clean_input_from_latents(
     indices = (
         torch.arange(0, sum([1, *history_sizes, latent_window_size])).unsqueeze(0).expand(target_latents.shape[0], -1)
     )
+    if use_ref_short_rope_shift:
+        from helios.modules.ref_short_rope import apply_ref_short_history_target_shift
+
+        indices = apply_ref_short_history_target_shift(indices)
     (
         indices_prefix,
         indices_latents_history_long,

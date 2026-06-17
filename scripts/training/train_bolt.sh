@@ -44,12 +44,12 @@ export PYTHONUNBUFFERED=1
 HELIOS_ROOT="/root/autodl-tmp/Helios"
 cd "${HELIOS_ROOT}"
 
-# 训练配置文件（可换为你的 yaml）
-CONFIG_YAML="${HELIOS_ROOT}/scripts/training/configs/bolt_ref_attn.yaml"
+# 训练配置文件（可通过环境变量 CONFIG_YAML 覆盖）
+CONFIG_YAML="${CONFIG_YAML:-${HELIOS_ROOT}/scripts/training/configs/bolt_ref_attn_5_17_stage1.yaml}"
 
 # 日志输出目录：应与 yaml 里 output_dir 一致，或训练时用 --output_dir 覆盖
 # 若仅改此处而不改 yaml，请同时传 --output_dir "$OUTPUT_DIR" 或在 yaml 中同步修改
-OUTPUT_DIR="${OUTPUT_DIR:-/root/autodl-tmp/Selector_VLM/bolt_ref_attn_run_5_4_cut025_merge085}"
+OUTPUT_DIR="${OUTPUT_DIR:-/root/autodl-fs/output/5_20_ref}"
 mkdir -p "${OUTPUT_DIR}"
 
 LOG_FILE="${OUTPUT_DIR}/train_$(date +%m%d_%H%M%S).log"

@@ -1,11 +1,11 @@
-output_dir: ablation_stage_2_init
-logging_dir: logs
+output_dir: /root/autodl-fs/output/ablation_stage_2_init_smoke_test
+logging_dir: /root/autodl-fs/output/ablation_stage_2_init_smoke_test/logs
 seed: 45
 
 
 report_to:
   tracker_name: Wan-Train
-  wandb_name: ablation_stage_2_init
+  wandb_name: /root/autodl-fs/output/ablation_stage_2_init_smoke_test
   report_to: wandb
 
 
@@ -18,20 +18,20 @@ data_config:
   single_res: true
   single_height: 384
   single_width: 640
-  dataloader_num_workers: 8
+  dataloader_num_workers: 2 #8
   prefetch_factor: 2
   caption_dropout_p: 0
   id_token: ""
   instance_data_root:
-    - "demo_data/ultravideo-long"
+    - "/root/autodl-fs/HeliosBench-Weights/demo_data/ultravideo-long"
   # ---- Stage 1 ----
   use_stage1_dataset: true
 
 
 model_config:
   # ---- Path ----
-  pretrained_model_name_or_path: "BestWishYsh/Helios-Base"
-  transformer_model_name_or_path: "BestWishYsh/Helios-Base"
+  pretrained_model_name_or_path: "/root/autodl-fs/BestWishYSH/Helios-Base"
+  transformer_model_name_or_path: "/root/autodl-fs/output/ablation_stage_1_init_smoke_test/merged"
   load_checkpoints_custom: false
   # load_model_path:
   load_dcp: false
@@ -41,7 +41,7 @@ model_config:
   enable_slicing: false
   enable_tiling: false
   # ---- Lora ----
-  lora_rank: 256
+  lora_rank: 32    #256
   lora_alpha: 256.0
   lora_dropout: 0.0
   lora_layers: "all-linear"
@@ -60,7 +60,7 @@ model_config:
 
 
 validation_config:
-  validation_steps: 500
+  validation_steps: 25 #500
   validation_height: 384
   validation_width: 640
   validation_max_num_frames: 99
@@ -89,16 +89,16 @@ training_config:
   offload: false
   mixed_precision: "bf16"
   # ---- Training Resource ----
-  max_train_steps: 1000000
+  max_train_steps: 100  #1000000
   train_batch_size: 1
   gradient_accumulation_steps: 1
-  checkpointing_steps: 500
+  checkpointing_steps: 25  #500
   resume_from_checkpoint: "latest"
   save_checkpoints_custom: false
   # ---- Optimizer ----
   learning_rate: 1e-4
   lr_scheduler: "constant_with_warmup"
-  lr_warmup_steps: 1000
+  lr_warmup_steps: 10  #1000
   optimizer: "adamw"
   adam_beta1: 0.9
   adam_beta2: 0.999

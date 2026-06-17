@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import html
+import inspect
 import math
 from enum import Enum
 from itertools import accumulate
@@ -494,6 +495,11 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         latents_history_short: torch.Tensor = None,
         latents_history_mid: torch.Tensor = None,
         latents_history_long: torch.Tensor = None,
+        latents_history_ref: torch.Tensor = None,
+        indices_latents_history_ref: torch.Tensor = None,
+        # ------------ Temporal Token Selection ------------
+        gap_latents: torch.Tensor = None,
+        gap_frame_indices: torch.Tensor = None,
         attention_kwargs: Optional[dict] = None,
         device: Optional[torch.device] = None,
         transformer_dtype: torch.dtype = None,
@@ -526,6 +532,14 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             timestep = t.expand(latents.shape[0])
 
             latent_model_input = latents.to(transformer_dtype)
+            # Prepare selector kwargs
+            _selector_kwargs = {}
+            if gap_latents is not None and gap_frame_indices is not None:
+                _selector_kwargs = {
+                    "gap_latents": gap_latents.to(transformer_dtype),
+                    "gap_frame_indices": gap_frame_indices,
+                }
+
             with self.transformer.cache_context("cond"):
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
@@ -538,9 +552,14 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     latents_history_short=latents_history_short.to(transformer_dtype),
                     latents_history_mid=latents_history_mid.to(transformer_dtype),
                     latents_history_long=latents_history_long.to(transformer_dtype),
+                    latents_history_ref=latents_history_ref.to(transformer_dtype)
+                    if latents_history_ref is not None
+                    else None,
+                    indices_latents_history_ref=indices_latents_history_ref,
                     is_first_denoising_step=is_first_step,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
+                    **_selector_kwargs,
                 )[0]
 
             if self.do_classifier_free_guidance and not use_dmd:
@@ -556,9 +575,14 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         latents_history_short=latents_history_short.to(transformer_dtype),
                         latents_history_mid=latents_history_mid.to(transformer_dtype),
                         latents_history_long=latents_history_long.to(transformer_dtype),
+                        latents_history_ref=latents_history_ref.to(transformer_dtype)
+                        if latents_history_ref is not None
+                        else None,
+                        indices_latents_history_ref=indices_latents_history_ref,
                         is_first_denoising_step=is_first_step,
                         attention_kwargs=attention_kwargs,
                         return_dict=False,
+                        **_selector_kwargs,
                     )[0]
 
                 if use_cfg_zero_star:
@@ -923,9 +947,13 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         anti_drift_delta_mu: float = 0.15,
         anti_drift_delta_sigma: float = 0.15,
         anti_drift_corruption_strength: float = 0.1,
+        # ------------ Temporal Token Selection ------------
+        use_selector: bool = False,
         # ------------ other ------------
         use_kv_cache: bool = False,
         vae_decode_type: VAEDecodeType = "default",  # "default", "default_batch"
+        chunk_callback: Optional[Callable] = None,
+        ref_short_validation_ctx=None,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -1198,7 +1226,7 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         # 6. Denoising loop
         if use_interpolate_prompt:
             if num_latent_sections < max(interpolate_cumulative_list):
-                num_latent_sections = sum(interpolate_cumulative_list)
+                num_latent_sections = max(interpolate_cumulative_list)
                 print(f"Update num_latent_sections to: {num_latent_sections}")
 
         for k in range(num_latent_sections):
@@ -1234,6 +1262,23 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
             is_first_section = k == 0
             is_second_section = k == 1
+            latents_history_ref_chunk = None
+            indices_latents_history_ref_chunk = None
+            ref_slot_count = 0
+            if ref_short_validation_ctx is not None:
+                from helios.utils.ref_short_validation import resolve_prompt_for_chunk
+
+                prompt_str = resolve_prompt_for_chunk(
+                    prompt,
+                    k,
+                    interpolate_time_list=interpolate_time_list if use_interpolate_prompt else None,
+                )
+                ref_short_validation_ctx.prepare_for_chunk(k, prompt_str)
+                latents_history_ref_chunk = ref_short_validation_ctx.latents_history_ref
+                indices_latents_history_ref_chunk = ref_short_validation_ctx.indices_latents_history_ref
+                if indices_latents_history_ref_chunk is not None:
+                    ref_slot_count = int(indices_latents_history_ref_chunk.shape[-1])
+
             if is_keep_x0:
                 if is_first_section:
                     history_sizes_first_section = [1] + history_sizes.copy()
@@ -1262,6 +1307,10 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             history_latents_first_section = video_latents
 
                     indices = torch.arange(0, sum([1, *history_sizes, latent_window_size]))
+                    if ref_short_validation_ctx is not None:
+                        from helios.modules.ref_short_rope import apply_ref_short_history_target_shift
+
+                        indices = apply_ref_short_history_target_shift(indices, ref_slot_count=ref_slot_count)
                     (
                         indices_prefix,
                         indices_latents_history_long,
@@ -1281,6 +1330,10 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     latents_history_short = torch.cat([latents_prefix, latents_history_1x], dim=2)
                 else:
                     indices = torch.arange(0, sum([1, *history_sizes, latent_window_size]))
+                    if ref_short_validation_ctx is not None:
+                        from helios.modules.ref_short_rope import apply_ref_short_history_target_shift
+
+                        indices = apply_ref_short_history_target_shift(indices, ref_slot_count=ref_slot_count)
                     (
                         indices_prefix,
                         indices_latents_history_long,
@@ -1320,7 +1373,16 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             )
 
             if not is_enable_stage2:
-                self.scheduler.set_timesteps(num_inference_steps, mu=1, device=device)
+                # Support both HeliosScheduler (expects stage_index) and diffusers schedulers like UniPCMultistepScheduler.
+                try:
+                    params = inspect.signature(self.scheduler.set_timesteps).parameters
+                    if "stage_index" in params:
+                        self.scheduler.set_timesteps(num_inference_steps=num_inference_steps, stage_index=0, device=device)
+                    else:
+                        self.scheduler.set_timesteps(num_inference_steps=num_inference_steps, device=device)
+                except Exception:
+                    # Last-resort fallback for older/unsupported scheduler signatures.
+                    self.scheduler.set_timesteps(num_inference_steps)
 
                 if use_dynamic_shifting:
                     sigmas = torch.linspace(
@@ -1355,6 +1417,22 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     if is_amplify_first_chunk and use_dmd and is_first_section
                     else sum(stage2_num_inference_steps_list)
                 )
+
+            # ===== Temporal Token Selection: compute gap_latents for selector =====
+            gap_latents_for_sample = None
+            gap_frame_indices_for_sample = None
+            _use_selector = use_selector and hasattr(self.transformer, 'selector_q_proj')
+            if _use_selector and not is_first_section:
+                # Gap = frames in history_latents before the current history window tail
+                # history_latents shape: (B, C, total_accumulated_T, H, W)
+                # The last sum(history_sizes) frames are the current short/mid/long history
+                total_hist_T = history_latents.shape[2]
+                gap_end = total_hist_T - sum(history_sizes)
+                # Skip the initial zero-padding region: first sum(history_sizes) frames are padding
+                gap_start = sum(history_sizes) + (1 if is_keep_x0 else 0)  # +1 to skip x0 frame
+                if gap_end > gap_start:
+                    gap_latents_for_sample = history_latents[:, :, gap_start:gap_end, :, :]
+                    gap_frame_indices_for_sample = torch.arange(gap_start, gap_end, device=device).unsqueeze(0).expand(batch_size, -1)
 
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 if is_enable_stage2:
@@ -1404,6 +1482,11 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         latents_history_short=latents_history_short,
                         latents_history_mid=latents_history_mid,
                         latents_history_long=latents_history_long,
+                        latents_history_ref=latents_history_ref_chunk,
+                        indices_latents_history_ref=indices_latents_history_ref_chunk,
+                        # ------------ Temporal Token Selection ------------
+                        gap_latents=gap_latents_for_sample,
+                        gap_frame_indices=gap_frame_indices_for_sample,
                         attention_kwargs=attention_kwargs,
                         device=device,
                         transformer_dtype=transformer_dtype,
@@ -1450,6 +1533,20 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
                 total_generated_latent_frames += latents.shape[2]
                 history_latents = torch.cat([history_latents, latents], dim=2)
+
+                # chunk_callback: 每个 chunk 生成后调用
+                if ref_short_validation_ctx is not None:
+                    from helios.utils.ref_short_validation import resolve_prompt_for_chunk
+
+                    next_prompt = resolve_prompt_for_chunk(
+                        prompt,
+                        k + 1,
+                        interpolate_time_list=interpolate_time_list if use_interpolate_prompt else None,
+                    )
+                    ref_short_validation_ctx.on_chunk_done(k, latents, prompt_for_next=next_prompt)
+                if chunk_callback is not None:
+                    chunk_callback(k, latents)
+
                 real_history_latents = history_latents[:, :, -total_generated_latent_frames:]
                 index_slice = (
                     slice(None),

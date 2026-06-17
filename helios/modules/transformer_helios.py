@@ -1,3 +1,42 @@
+# ============================================================================
+# Helios Transformer 架构总览 (中文注释版)
+# ============================================================================
+#
+# 【整体架构】
+# 这是 Helios 视频生成模型的核心 Transformer 模块，基于 DiT (Diffusion Transformer) 架构。
+# 主要用于 文本→视频 (T2V) 的扩散生成任务。
+#
+# 【核心组件层级关系】
+#
+#   HeliosTransformer3DModel (顶层模型)
+#   ├── HeliosRotaryPosEmbed          — 3D 旋转位置编码 (RoPE)，分别编码时间/高度/宽度
+#   ├── nn.Conv3d (patch_embedding)   — 3D 卷积将视频 latent 切分为 patch 并嵌入
+#   ├── HeliosTimeTextEmbedding       — 时间步 + 文本条件嵌入
+#   │   ├── Timesteps                 — 正弦时间步编码
+#   │   ├── TimestepEmbedding         — 时间步 MLP
+#   │   └── PixArtAlphaTextProjection — 文本嵌入投影
+#   ├── HeliosTransformerBlock × N    — N 层 Transformer 块 (默认 40 层)
+#   │   ├── norm1 + HeliosAttention (attn1)  — 自注意力 (Self-Attention)
+#   │   ├── norm2 + HeliosAttention (attn2)  — 交叉注意力 (Cross-Attention, 文本条件)
+#   │   ├── norm3 + FeedForward (ffn)        — 前馈网络 (FFN)
+#   │   └── scale_shift_table               — AdaLN 自适应归一化参数
+#   ├── HeliosOutputNorm              — 输出归一化
+#   ├── nn.Linear (proj_out)          — 输出投影，还原到像素空间
+#   └── [可选] 多尺度历史记忆 patch (patch_short/mid/long)
+#       └── [可选] GAN 判别器头 (Discriminator3DHead)
+#
+# 【关键特性】
+# 1. NAViT: 支持变长序列打包 (不同分辨率视频在同一 batch 中训练)
+# 2. 多尺度历史记忆: short/mid/long 三级历史 latent，用于长视频生成的时序一致性
+# 3. Restrict Self-Attention: 历史帧与当前帧分离注意力，提升效率
+# 4. LoRA: 可选的低秩适配器，用于历史帧的 QKV 投影微调
+# 5. History Key Amplification: 可学习的历史 key 缩放因子，增强历史帧的注意力权重
+# 6. GAN 判别器: 可选的对抗训练头，从中间层和最终输出提取特征做判别
+# 7. KV Cache: 推理时缓存历史帧的 KV，避免重复计算
+# 8. 3D RoPE: 时间-空间联合旋转位置编码
+# 9. AdaLN (Adaptive Layer Norm): 时间步条件调制归一化
+# ============================================================================
+
 # Copyright 2025 The Helios Team and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,7 +86,13 @@ from .helios_kernels import attn_varlen_func, create_navit_attention_masks
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
+# ============================================================================
+# 工具函数
+# ============================================================================
+
 def pad_for_3d_conv(x, kernel_size):
+    """为 3D 卷积做边缘填充，确保 t/h/w 维度能被 kernel_size 整除。
+    用于多尺度历史 latent 的 patch_mid / patch_long 卷积前的对齐。"""
     b, c, t, h, w = x.shape
     pt, ph, pw = kernel_size
     pad_t = (pt - (t % pt)) % pt
@@ -57,6 +102,7 @@ def pad_for_3d_conv(x, kernel_size):
 
 
 def center_down_sample_3d(x, kernel_size):
+    """3D 平均池化下采样，用于对历史 latent 的 RoPE 频率做对应的空间降采样。"""
     return torch.nn.functional.avg_pool3d(x, kernel_size, stride=kernel_size)
 
 
@@ -64,6 +110,9 @@ def apply_rotary_emb_transposed(
     hidden_states: torch.Tensor,
     freqs_cis: torch.Tensor,
 ):
+    """应用旋转位置编码 (RoPE) 到 hidden_states 上。
+    将最后一维拆成偶数/奇数对，分别与 cos/sin 频率做旋转变换。
+    这是 3D RoPE 的核心计算，使模型感知 token 在时间-空间中的位置。"""
     x_1, x_2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
     cos, sin = freqs_cis.unsqueeze(-2).chunk(2, dim=-1)
     out = torch.empty_like(hidden_states)
@@ -73,6 +122,9 @@ def apply_rotary_emb_transposed(
 
 
 def _get_qkv_projections(attn: "HeliosAttention", hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor):
+    """获取 Q/K/V 投影。支持两种模式:
+    - 融合投影 (fused): 自注意力用 to_qkv 一次算出 QKV; 交叉注意力用 to_q + to_kv
+    - 非融合投影: 分别用 to_q, to_k, to_v 三个独立线性层"""
     # encoder_hidden_states is only passed for cross-attention
     if encoder_hidden_states is None:
         encoder_hidden_states = hidden_states
@@ -92,7 +144,15 @@ def _get_qkv_projections(attn: "HeliosAttention", hidden_states: torch.Tensor, e
     return query, key, value
 
 
+# ============================================================================
+# 辅助模块
+# ============================================================================
+
 class Discriminator3DHead(nn.Module):
+    """GAN 判别器的 3D 卷积头。
+    将 Transformer 中间层或最终输出的 5D 特征 (B,C,T,H,W) 通过多层 3D 卷积逐步下采样，
+    最终经过自适应平均池化 + 全连接层输出标量 logit (真/假判别分数)。
+    用于对抗训练 (DMD-GAN) 以提升生成质量。"""
     def __init__(self, input_channel, cond_map_dim=768):
         super().__init__()
 
@@ -127,6 +187,9 @@ class Discriminator3DHead(nn.Module):
 
 
 class LoRALinearLayer(nn.Module):
+    """低秩适配器 (LoRA) 线性层。结构: input -> down(降维到rank) -> up(升维回原维度)。
+    down 权重用正态分布初始化，up 权重初始化为零，确保训练初始时 LoRA 输出为零 (不影响原模型)。
+    用于历史帧的 QKV 投影微调，仅在 restrict_lora=True 时启用。"""
     def __init__(
         self,
         in_features: int,
@@ -155,6 +218,10 @@ class LoRALinearLayer(nn.Module):
 
 
 class HeliosOutputNorm(nn.Module):
+    """输出归一化层，使用 AdaLN (自适应层归一化)。
+    通过 scale_shift_table 参数 + 时间步嵌入 temb 生成 shift/scale，
+    对 Transformer 最终输出做条件归一化: output = norm(x) * (1 + scale) + shift。
+    只处理当前帧 (original_context_length)，不处理历史帧。"""
     def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = False):
         super().__init__()
         self.scale_shift_table = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
@@ -169,7 +236,25 @@ class HeliosOutputNorm(nn.Module):
         return hidden_states
 
 
+# ============================================================================
+# 注意力模块
+# ============================================================================
+
 class HeliosAttnProcessor:
+    """注意力计算处理器，实现了 Helios 的核心注意力逻辑。
+    
+    【核心流程】
+    1. QKV 投影 + RMSNorm 归一化
+    2. 如果 restrict_self_attn: 将历史帧和当前帧的 QKV 分离处理
+       - 历史帧可选加 LoRA 偏移
+       - 历史帧做独立的自注意力 (只看自己)
+       - 当前帧的 KV 拼接历史帧的 KV (当前帧能看到历史帧)
+    3. 应用 RoPE 旋转位置编码
+    4. 如果 is_amplify_history: 对历史帧的 key 乘以可学习缩放因子
+    5. 调用 attn_varlen_func 执行实际的注意力计算 (支持变长序列)
+    6. 输出投影 + Dropout
+    
+    【KV Cache】推理时可缓存历史帧的 KV，后续去噪步骤直接复用。"""
     _attention_backend = None
     _parallel_config = None
 
@@ -456,6 +541,19 @@ class HeliosAttnProcessor2_0:
 
 
 class HeliosAttention(torch.nn.Module, AttentionModuleMixin):
+    """Helios 注意力模块，封装了 QKV 投影层、归一化层和注意力处理器。
+    
+    【组件】
+    - to_q/to_k/to_v: QKV 线性投影
+    - norm_q/norm_k: RMSNorm 对 Q/K 做归一化 (QK-Norm，稳定训练)
+    - to_out: 输出投影 + Dropout
+    - [可选] q_loras/k_loras/v_loras: 历史帧的 LoRA 适配器
+    - [可选] history_key_scale: 历史帧 key 的可学习缩放因子
+    
+    【特性】
+    - 支持自注意力和交叉注意力两种模式
+    - 支持 QKV 融合投影 (fuse_projections) 加速推理
+    - 实际计算委托给 processor (HeliosAttnProcessor)"""
     _default_processor_cls = HeliosAttnProcessor
     _available_processors = [HeliosAttnProcessor]
 
@@ -620,7 +718,19 @@ class HeliosAttention(torch.nn.Module, AttentionModuleMixin):
         )
 
 
+# ============================================================================
+# 嵌入模块
+# ============================================================================
+
 class HeliosTimeTextEmbedding(nn.Module):
+    """时间步 + 文本条件嵌入模块。
+    
+    【数据流】
+    timestep (标量) -> 正弦编码 (Timesteps) -> MLP (TimestepEmbedding) -> temb (时间嵌入)
+                                                                        -> SiLU + Linear -> timestep_proj (AdaLN 用的 6 组参数)
+    text_embed -> PixArtAlphaTextProjection (GELU-Tanh + Linear) -> encoder_hidden_states (文本嵌入)
+    
+    temb 用于 AdaLN 的条件调制，timestep_proj 生成 shift/scale/gate 共 6 组参数。"""
     def __init__(
         self,
         dim: int,
@@ -667,6 +777,15 @@ class HeliosTimeTextEmbedding(nn.Module):
 
 
 class HeliosRotaryPosEmbed(nn.Module):
+    """3D 旋转位置编码 (RoPE)，分别为时间 (T)、高度 (Y)、宽度 (X) 三个维度生成频率。
+    
+    【原理】
+    - 每个维度有独立的频率基 freqs_base = 1/theta^(2i/d)
+    - 给定位置坐标，计算 cos/sin 频率对
+    - 最终拼接 [cos_t, cos_y, cos_x, sin_t, sin_y, sin_x] 作为 RoPE 频率
+    
+    【维度分配】默认 rope_dim=(44,42,42)，总计 44+42+42=128 维 = attention_head_dim
+    使用 lru_cache 缓存空间网格，避免重复计算。"""
     def __init__(self, rope_dim, theta):
         super().__init__()
         self.DT, self.DY, self.DX = rope_dim
@@ -714,8 +833,25 @@ class HeliosRotaryPosEmbed(nn.Module):
         return result.permute(1, 0, 2, 3, 4)
 
 
+# ============================================================================
+# Transformer Block
+# ============================================================================
+
 @maybe_allow_in_graph
 class HeliosTransformerBlock(nn.Module):
+    """单个 Transformer 块，包含三个子层:
+    
+    1. 自注意力 (attn1): AdaLN → Self-Attention → 残差连接 (带 gate)
+    2. 交叉注意力 (attn2): LayerNorm → Cross-Attention (文本条件) → 残差连接
+    3. 前馈网络 (ffn): AdaLN → FFN (GELU-approximate) → 残差连接 (带 gate)
+    
+    【AdaLN 机制】
+    scale_shift_table (可学习参数) + timestep_proj → 6 组参数:
+    - shift_msa, scale_msa, gate_msa: 控制自注意力的归一化和门控
+    - c_shift_msa, c_scale_msa, c_gate_msa: 控制 FFN 的归一化和门控
+    
+    【guidance_cross_attn】
+    当启用时，交叉注意力只作用于当前帧，历史帧不参与交叉注意力 (跳过)。"""
     def __init__(
         self,
         dim: int,
@@ -902,10 +1038,32 @@ class HeliosTransformerBlock(nn.Module):
         return hidden_states
 
 
+# ============================================================================
+# 顶层模型
+# ============================================================================
+
 class HeliosTransformer3DModel(
     ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin, CacheMixin, AttentionMixin
 ):
-    r"""
+    r"""Helios 3D Transformer 顶层模型，用于视频扩散生成。
+    
+    【前向传播流程 (forward)】
+    1. process_input_hidden_states: 
+       - 当前帧 latent → patch_embedding (3D Conv) → flatten → 序列
+       - 历史帧 latent → patch_short/mid/long (多尺度 3D Conv) → flatten → 拼接到序列前面
+       - 同时生成对应的 3D RoPE 频率
+    2. condition_embedder: 时间步 + 文本 → temb + timestep_proj + encoder_hidden_states
+       - 如果 zero_history_timestep: 历史帧使用 t=0 的时间步嵌入
+    3. 40 层 HeliosTransformerBlock: 自注意力 + 交叉注意力 + FFN
+       - 如果 GAN 模式: 在指定层 (gan_hooks) 提取中间特征
+    4. 输出归一化 + 线性投影 + unpatchify (还原为视频 latent 形状)
+    5. 如果 GAN 模式: 中间特征和最终输出通过 Discriminator3DHead 得到判别 logits
+    
+    【多尺度历史记忆 (Stage1)】
+    - patch_short: kernel=(1,2,2) — 短期记忆，保留完整时间分辨率
+    - patch_mid:   kernel=(2,4,4) — 中期记忆，2x 时间压缩 + 4x 空间压缩
+    - patch_long:  kernel=(4,8,8) — 长期记忆，4x 时间压缩 + 8x 空间压缩
+    
     A Transformer model for video-like data used in the Helios model.
 
     Args:
@@ -947,6 +1105,7 @@ class HeliosTransformer3DModel(
         "patch_short",
         "patch_mid",
         "patch_long",
+        "patch_ref",
         "condition_embedder",
         "norm",
     ]
@@ -1066,7 +1225,9 @@ class HeliosTransformer3DModel(
             self.patch_short = nn.Conv3d(in_channels, self.inner_dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
             self.patch_mid = nn.Conv3d(in_channels, self.inner_dim, kernel_size=(2, 4, 4), stride=(2, 4, 4))
             self.patch_long = nn.Conv3d(in_channels, self.inner_dim, kernel_size=(4, 8, 8), stride=(4, 8, 8))
+            self.patch_ref = nn.Conv3d(in_channels, self.inner_dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
             self.initialize_weight_from_another_conv3d(self.patch_embedding)
+            self.initialize_patch_ref_from_patch_short()
 
         # 6. Initial Gan
         self.is_use_gan = is_use_gan
@@ -1086,6 +1247,8 @@ class HeliosTransformer3DModel(
 
     @torch.no_grad()
     def initialize_weight_from_another_conv3d(self, another_layer):
+        """从 patch_embedding 的权重初始化 patch_short/mid/long。
+        mid 和 long 通过 repeat + 缩放来适配更大的 kernel_size。"""
         weight = another_layer.weight.detach().clone()
         bias = another_layer.bias.detach().clone()
 
@@ -1104,6 +1267,13 @@ class HeliosTransformer3DModel(
         sd = {k: v.clone() for k, v in sd.items()}
 
         self.load_state_dict(sd, strict=False)
+
+    @torch.no_grad()
+    def initialize_patch_ref_from_patch_short(self) -> None:
+        if not hasattr(self, "patch_ref") or not hasattr(self, "patch_short"):
+            return
+        self.patch_ref.weight.copy_(self.patch_short.weight)
+        self.patch_ref.bias.copy_(self.patch_short.bias)
 
     def gradient_checkpointing_method(self, block, *args):
         if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -1129,7 +1299,7 @@ class HeliosTransformer3DModel(
 
     def process_input_hidden_states(
         self,
-        latents,
+        latents,  # 当前帧 latent 或 NAViT 模式下的多分辨率 latent 列表
         indices_hidden_states=None,
         indices_latents_history_short=None,
         indices_latents_history_mid=None,
@@ -1137,6 +1307,8 @@ class HeliosTransformer3DModel(
         latents_history_short=None,
         latents_history_mid=None,
         latents_history_long=None,
+        latents_history_ref=None,
+        indices_latents_history_ref=None,
     ):
         height_list = []
         width_list = []
@@ -1197,6 +1369,24 @@ class HeliosTransformer3DModel(
             temporal_list.append(T)
             seq_list.append(hidden_states.shape[1])
 
+        # Process ref latents (after target embed, before short — final order: long|mid|short|ref|target)
+        if latents_history_ref is not None and indices_latents_history_ref is not None:
+            latents_history_ref = latents_history_ref.to(hidden_states)
+            latents_history_ref = self.gradient_checkpointing_method(self.patch_ref, latents_history_ref)
+            _, _, _, H_ref, W_ref = latents_history_ref.shape
+            latents_history_ref = latents_history_ref.flatten(2).transpose(1, 2)
+
+            rope_freqs_history_ref = self.rope(
+                frame_indices=indices_latents_history_ref,
+                height=H_ref,
+                width=W_ref,
+                device=latents_history_ref.device,
+            )
+            rope_freqs_history_ref = rope_freqs_history_ref.flatten(2).transpose(1, 2)
+
+            hidden_states = torch.cat([latents_history_ref, hidden_states], dim=1)
+            rope_freqs = torch.cat([rope_freqs_history_ref, rope_freqs], dim=1)
+
         # Process short history latents
         if latents_history_short is not None and indices_latents_history_short is not None:
             latents_history_short = latents_history_short.to(hidden_states)
@@ -1204,7 +1394,7 @@ class HeliosTransformer3DModel(
             _, _, _, H1, W1 = latents_history_short.shape
             latents_history_short = latents_history_short.flatten(2).transpose(1, 2)
 
-            rope_freqs_history_short = self.rope(
+            rope_freqs_history_short = self.rope( #w位置编码非连续
                 frame_indices=indices_latents_history_short,
                 height=H1,
                 width=W1,
@@ -1278,6 +1468,8 @@ class HeliosTransformer3DModel(
         latents_history_short=None,
         latents_history_mid=None,
         latents_history_long=None,
+        latents_history_ref=None,
+        indices_latents_history_ref=None,
         is_first_denoising_step: bool = False,
         # ------------ GAN ------------
         gan_mode: bool = False,
@@ -1310,6 +1502,8 @@ class HeliosTransformer3DModel(
             indices_latents_history_mid = indices_latents_history_mid.unsqueeze(0)
         if indices_latents_history_long is not None and indices_latents_history_long.ndim == 1:
             indices_latents_history_long = indices_latents_history_long.unsqueeze(0)
+        if indices_latents_history_ref is not None and indices_latents_history_ref.ndim == 1:
+            indices_latents_history_ref = indices_latents_history_ref.unsqueeze(0)
 
         if gan_mode:
             assert self.is_use_gan
@@ -1340,6 +1534,8 @@ class HeliosTransformer3DModel(
             latents_history_short=latents_history_short,
             latents_history_mid=latents_history_mid,
             latents_history_long=latents_history_long,
+            latents_history_ref=latents_history_ref,
+            indices_latents_history_ref=indices_latents_history_ref,
         )  # hidden: [high, mid, low] -> [low, mid, high]
         post_patch_num_frames = sum(post_patch_num_frames_list)
         post_patch_height = sum(post_patch_height_list)

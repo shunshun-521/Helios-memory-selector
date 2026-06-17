@@ -18,18 +18,20 @@ transformer_additional_kwargs = {
     "restrict_lora_rank": 128,
 }
 
+# Stage 3 ODE: 基础 transformer 来自 Stage 2 合并后的权重
 transformer = HeliosTransformer3DModel.from_pretrained(
-    "1_formal_ckpts/ablation_stage3_2_mid-train_v4_e2500-ema",
+    "/root/autodl-fs/output/ablation_stage_2_init_smoke_test/merged",
     subfolder="transformer",
     transformer_additional_kwargs=transformer_additional_kwargs,
 )
 pipe = HeliosPipeline.from_pretrained(
-    "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+    "/root/autodl-fs/BestWishYSH/Helios-Base",
     transformer=transformer,
 )
 
+# 使用 EMA 权重（model_ema/ 目录）
 pipe.load_lora_weights(
-    "ablation_stage3_3_post-train-emergency_only-gan/checkpoint-2000/model_ema/pytorch_lora_weights.safetensors",
+    "/root/autodl-fs/output/ablation_stage_3_ode_smoke_test/checkpoint-100/model_ema/pytorch_lora_weights.safetensors",
     adapter_name="default",
 )
 pipe.set_adapters(["default"], adapter_weights=[1.0])
@@ -39,17 +41,17 @@ args = Namespace()
 if not hasattr(args, "training_config"):
     args.training_config = Namespace()
 args.training_config.is_enable_stage1 = True
-args.training_config.restrict_self_attn = True
-args.training_config.is_amplify_history = True
-args.training_config.is_use_gan = True
+args.training_config.restrict_self_attn = False
+args.training_config.is_amplify_history = False
+args.training_config.is_use_gan = False
 load_extra_components(
     args,
     transformer,
-    "ablation_stage3_3_post-train-emergency_only-gan/checkpoint-2000/model_ema/transformer_partial.pth",
+    "/root/autodl-fs/output/ablation_stage_3_ode_smoke_test/checkpoint-100/model_ema/transformer_partial.pth",
 )
 
 pipe.fuse_lora()
 pipe.unload_lora_weights()
 pipe.transformer.save_pretrained(
-    "1_formal_ckpts/ablation_stage3_3_post-train-emergency_only-gan_e2000-ema/transformer"
+    "/root/autodl-fs/output/ablation_stage_3_ode_smoke_test/merged/transformer"
 )

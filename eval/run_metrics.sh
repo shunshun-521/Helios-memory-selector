@@ -1,4 +1,4 @@
-INPUT_CSV="playground/helios_t2v_prompts.csv"
+INPUT_CSV="playground/eval_prompts.csv"
 BASE_OUTPUT_DIR="playground/results"
 PLAYGROUND_DIR="playground"
 

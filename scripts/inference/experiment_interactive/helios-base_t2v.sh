@@ -1,27 +1,50 @@
-# Example: Running inference with 2-GPU parallelism
-# CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node 2 infer_helios.py \
-#     --enable_parallelism \
-#     --cp_backend "ulysses" \   #  ["ring", "ulysses", "unified", "ulysses_anything"]
+#!/usr/bin/env bash
+set -euo pipefail
 
-CUDA_VISIBLE_DEVICES=0 python infer_helios.py \
-    --base_model_path "BestWishYsh/Helios-Base" \
-    --transformer_path "BestWishYsh/Helios-Base" \
-    --sample_type "t2v" \
-    --num_frames 1452 \
-    --fps 24 \
-    --prompt "A vibrant tropical fish swimming gracefully among colorful coral reefs in a clear, turquoise ocean. The fish has bright blue and yellow scales with a small, distinctive orange spot on its side, its fins moving fluidly. The coral reefs are alive with a variety of marine life, including small schools of colorful fish and sea turtles gliding by. The water is crystal clear, allowing for a view of the sandy ocean floor below. The reef itself is adorned with a mix of hard and soft corals in shades of red, orange, and green. The photo captures the fish from a slightly elevated angle, emphasizing its lively movements and the vivid colors of its surroundings. A close-up shot with dynamic movement." \
-    --guidance_scale 5.0 \
-    --enable_compile \
-    --use_interpolate_prompt \
-    --interpolation_steps 3 \
-    --interactive_prompt_csv_path "example/prompt_interactive_helios.csv" \
-    --interpolate_time 7 \
-    --output_folder "./output_helios/helios-base"
+export TMPDIR="/root/autodl-fs/tmp"
+export HF_ENDPOINT="https://hf-mirror.com"
+export HELIOS_SKIP_FLASH_KERNEL_DOWNLOAD=1
 
+PYTHON_BIN="python"
+INFER_PY="/root/autodl-tmp/Helios/infer_helios.py"
 
-    # --enable_low_vram_mode \
-    # --group_offloading_type "leaf_level" \  # ["leaf_level", "block_level"]
-    # --num_blocks_per_group
-    # --use_cfg_zero_star \
-    # --use_zero_init \
-    # --zero_steps 1 \
+BASE_MODEL="/root/autodl-fs/BestWishYSH/Helios-Base"
+WAN_TRANSFORMER="/root/autodl-fs/BestWishYSH/Helios-Base"
+LORA_CKPT="/root/autodl-fs/output/5_17/checkpoint-1500/pytorch_lora_weights.safetensors"
+
+OUT_ROOT="/root/autodl-fs/output/5_17/infer_compare_interactive"
+PROMPT_CSV="${OUT_ROOT}/interactive_stage1_init_prompts.csv"
+
+mkdir -p "${OUT_ROOT}"
+
+# Keep prompts / duration / interpolation settings aligned with scripts/training/configs/stage_1_init.yaml
+cat > "${PROMPT_CSV}" <<'EOF'
+id,prompt_index,prompt
+0,0,"A skateboarder in a white t-shirt with a red lightning bolt walks down a suburban street, holding his board as the sun casts long shadows."
+0,1,"The skateboarder walks into a graffiti-covered tunnel, his shadow stretching on the concrete walls as he moves deeper into the dim space."
+0,2,"Emerging from the tunnel, the skateboarder rides his board out into the bright daylight, silhouetted against the open sky."
+EOF
+
+COMMON_ARGS=(
+  --base_model_path "${BASE_MODEL}"
+  --transformer_path "${WAN_TRANSFORMER}"
+  --sample_type "t2v"
+  --seed 43
+  --height 384
+  --width 640
+  --num_frames 99
+  --fps 24
+  --num_inference_steps 50
+  --guidance_scale 5.0
+  --num_latent_frames_per_chunk 9
+  --use_interpolate_prompt
+  --interpolation_steps 1
+  --interactive_prompt_csv_path "${PROMPT_CSV}"
+  --interpolate_time_list 2 3 4
+
+)
+
+echo "[Run] helios-base baseline (no LoRA)"
+CUDA_VISIBLE_DEVICES=0 "${PYTHON_BIN}" "${INFER_PY}" \
+  "${COMMON_ARGS[@]}" \
+  --output_folder "${OUT_ROOT}/Helios-Base"

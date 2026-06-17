@@ -1,23 +1,31 @@
-import torch
-from kernels import get_kernel
+import os
 
+import torch
+try:
+    from kernels import get_kernel
+except Exception:
+    get_kernel = None
+
+
+SKIP_FLASH_KERNEL_DOWNLOAD = os.getenv("HELIOS_SKIP_FLASH_KERNEL_DOWNLOAD", "0") == "1"
 
 try:
-    # raise NotImplementedError
+    if get_kernel is None:
+        raise RuntimeError("python package `kernels` is not available")
+    if SKIP_FLASH_KERNEL_DOWNLOAD:
+        raise RuntimeError("Skip flash kernel download by HELIOS_SKIP_FLASH_KERNEL_DOWNLOAD=1")
     try:
         flash_attn3 = get_kernel("kernels-community/flash-attn3")
         flash_attn_func = flash_attn3.flash_attn_func
         flash_attn_varlen_func = flash_attn3.flash_attn_varlen_func
-
         print("Flash Attn 3 is installed!")
-    except ImportError:
+    except Exception:
         flash_attn2 = get_kernel("kernels-community/flash-attn2")
         flash_attn_func = flash_attn2.flash_attn_func
         flash_attn_varlen_func = flash_attn2.flash_attn_varlen_func
-
         print("Flash Attn 2 is installed!")
-except ImportError:
-    print("Flash Attn 2 / 3 is not installed!")
+except Exception as e:
+    print(f"Flash Attn 2 / 3 is unavailable, fallback to torch attention. reason={e}")
     flash_attn_varlen_func = None
     flash_attn_func = None
 
@@ -127,6 +135,31 @@ def _flash_attn_varlen_wrapper(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_
     return flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
 
 
+def _torch_sdpa_varlen_fallback(q, k, v, cu_seqlens_q, cu_seqlens_kv):
+    """Fallback varlen attention using torch SDPA per segment."""
+    out = torch.empty_like(q)
+    num_segments = cu_seqlens_q.numel() - 1
+    for i in range(num_segments):
+        q_start = int(cu_seqlens_q[i].item())
+        q_end = int(cu_seqlens_q[i + 1].item())
+        k_start = int(cu_seqlens_kv[i].item())
+        k_end = int(cu_seqlens_kv[i + 1].item())
+        if q_end <= q_start or k_end <= k_start:
+            continue
+
+        q_seg = q[q_start:q_end]  # [Lq, H, C]
+        k_seg = k[k_start:k_end]  # [Lk, H, C]
+        v_seg = v[k_start:k_end]  # [Lk, H, C]
+
+        # SDPA expects [B, H, L, C]
+        q_b = q_seg.permute(1, 0, 2).unsqueeze(0)
+        k_b = k_seg.permute(1, 0, 2).unsqueeze(0)
+        v_b = v_seg.permute(1, 0, 2).unsqueeze(0)
+        o_b = torch.nn.functional.scaled_dot_product_attention(q_b, k_b, v_b)
+        out[q_start:q_end] = o_b.squeeze(0).permute(1, 0, 2)
+    return out
+
+
 def attn_varlen_func(q, k, v, attention_mask=None):
     if attention_mask is None:
         if flash_attn_func is not None:
@@ -158,7 +191,7 @@ def attn_varlen_func(q, k, v, attention_mask=None):
     elif sageattn_varlen is not None:
         x = sageattn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
     else:
-        raise NotImplementedError("No Attn Installed!")
+        x = _torch_sdpa_varlen_fallback(q, k, v, cu_seqlens_q, cu_seqlens_kv)
 
     x = x.unflatten(0, (B, L))
 

@@ -16,7 +16,7 @@ from transformers import CLIPModel, AutoTokenizer, CLIPProcessor
 
 
 CLIP_DEFAULT_PATH = "/root/autodl-fs/clip-vit-large-patch14/AI-ModelScope/clip-vit-large-patch14"
-DINOv2_DEFAULT_ID = "facebook/dinov2-base"
+DINOv2_DEFAULT_ID = "/root/autodl-fs/dinov2-base"
 
 
 class CLIP:
@@ -149,8 +149,13 @@ def decode_middle_frame(chunk_latent, vae, latents_mean, latents_std):
     mid_t = T // 2
     mid_latent = chunk_latent[:, :, mid_t:mid_t + 1, :, :]
 
+    vae_device = next(vae.parameters()).device
+    vae_dtype = next(vae.parameters()).dtype
     with torch.no_grad():
-        normalized = mid_latent.to(vae.dtype) / latents_std.to(mid_latent.device) + latents_mean.to(mid_latent.device)
+        mid_latent = mid_latent.to(device=vae_device, dtype=vae_dtype)
+        latents_std = latents_std.to(device=vae_device, dtype=vae_dtype)
+        latents_mean = latents_mean.to(device=vae_device, dtype=vae_dtype)
+        normalized = mid_latent / latents_std + latents_mean
         pixel = vae.decode(normalized).sample
 
     pixel = pixel[0, :, 0].clamp(-1, 1).add(1).div(2)
@@ -168,8 +173,13 @@ def decode_last_frame(chunk_latent, vae, latents_mean, latents_std):
     last_t = max(0, T - 1)
     last_latent = chunk_latent[:, :, last_t:last_t + 1, :, :]
 
+    vae_device = next(vae.parameters()).device
+    vae_dtype = next(vae.parameters()).dtype
     with torch.no_grad():
-        normalized = last_latent.to(vae.dtype) / latents_std.to(last_latent.device) + latents_mean.to(last_latent.device)
+        last_latent = last_latent.to(device=vae_device, dtype=vae_dtype)
+        latents_std = latents_std.to(device=vae_device, dtype=vae_dtype)
+        latents_mean = latents_mean.to(device=vae_device, dtype=vae_dtype)
+        normalized = last_latent / latents_std + latents_mean
         pixel = vae.decode(normalized).sample
 
     pixel = pixel[0, :, 0].clamp(-1, 1).add(1).div(2)
@@ -197,10 +207,13 @@ def decode_all_frames(chunk_latent, vae, latents_mean, latents_std, max_frames=N
         raise ValueError(f"decode_all_frames expects batch size 1, got {chunk_latent.shape[0]}")
 
     total_t = int(chunk_latent.shape[2])
+    vae_device = next(vae.parameters()).device
+    vae_dtype = next(vae.parameters()).dtype
     with torch.no_grad():
-        normalized = chunk_latent.to(vae.dtype) / latents_std.to(chunk_latent.device) + latents_mean.to(
-            chunk_latent.device
-        )
+        chunk_latent = chunk_latent.to(device=vae_device, dtype=vae_dtype)
+        latents_std = latents_std.to(device=vae_device, dtype=vae_dtype)
+        latents_mean = latents_mean.to(device=vae_device, dtype=vae_dtype)
+        normalized = chunk_latent / latents_std + latents_mean
         pixel = vae.decode(normalized).sample
 
     # (1, 3, T, H, W) -> (T, H, W, 3)

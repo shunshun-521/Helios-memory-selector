@@ -52,7 +52,7 @@ from helios.modules.helios_kernels import (
     replace_all_norms_with_flash_norms,
     replace_rope_with_flash_rope,
 )
-from helios.modules.extract_feature import CLIP, decode_middle_frame, extract_chunk_feature
+from helios.modules.extract_feature import CLIP, DINOv2, decode_middle_frame, extract_chunk_feature
 from helios.modules.select_frames import inverse_transform_sampling
 from helios.modules.ref_attn_bolt import BoltReferenceAttentionLayers, patchify_selected_latents
 from helios.modules.select_frames_vlm import VLMFrameSelector
@@ -214,6 +214,77 @@ def build_history_and_target(vae_latent, choice_idx):
 # Training
 # ═══════════════════════════════════════════
 
+def _decode_middle_frame_tensor(
+    chunk_latent: torch.Tensor,
+    vae: AutoencoderKLWan,
+    latents_mean: torch.Tensor,
+    latents_std: torch.Tensor,
+) -> torch.Tensor:
+    """Differentiable middle-frame decode for ID loss.
+
+    Returns:
+        Tensor (B, 3, H, W) in [0, 1]
+    """
+    if chunk_latent.ndim == 4:
+        chunk_latent = chunk_latent.unsqueeze(0)
+    if chunk_latent.ndim != 5:
+        raise ValueError(f"chunk_latent must be 4D/5D, got shape={tuple(chunk_latent.shape)}")
+
+    t_mid = int(chunk_latent.shape[2]) // 2
+    mid_latent = chunk_latent[:, :, t_mid : t_mid + 1, :, :]
+
+    vae_device = next(vae.parameters()).device
+    vae_dtype = next(vae.parameters()).dtype
+
+    mid_latent = mid_latent.to(device=vae_device, dtype=vae_dtype)
+    lm = latents_mean.to(device=vae_device, dtype=vae_dtype)
+    ls = latents_std.to(device=vae_device, dtype=vae_dtype)
+    normalized = mid_latent / ls + lm
+
+    pixel = vae.decode(normalized).sample  # (B, 3, 1, H, W)
+    frame = pixel[:, :, 0].clamp(-1, 1).add(1).div(2)  # (B, 3, H, W), [0,1]
+    return frame
+
+
+def _dino_forward_on_frames(frames_01: torch.Tensor, dino_encoder: DINOv2) -> torch.Tensor:
+    """Run DINOv2 on frame tensor and return pooled feature.
+
+    Args:
+        frames_01: (B, 3, H, W), range [0,1]
+    Returns:
+        Tensor (B, D)
+    """
+    if frames_01.ndim != 4:
+        raise ValueError(f"frames_01 must be 4D, got shape={tuple(frames_01.shape)}")
+
+    proc = dino_encoder.processor
+    model = dino_encoder.model
+    model_device = next(model.parameters()).device
+    model_dtype = next(model.parameters()).dtype
+
+    # DINOv2 default resolution is typically 224x224.
+    target_h = 224
+    target_w = 224
+    if hasattr(proc, "size") and isinstance(proc.size, dict):
+        target_h = int(proc.size.get("height", proc.size.get("shortest_edge", 224)))
+        target_w = int(proc.size.get("width", proc.size.get("shortest_edge", 224)))
+    elif hasattr(proc, "crop_size") and isinstance(proc.crop_size, dict):
+        target_h = int(proc.crop_size.get("height", 224))
+        target_w = int(proc.crop_size.get("width", 224))
+
+    x = F.interpolate(frames_01, size=(target_h, target_w), mode="bilinear", align_corners=False)
+    mean = torch.tensor(proc.image_mean, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    std = torch.tensor(proc.image_std, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    x = (x - mean) / std
+    x = x.to(device=model_device, dtype=model_dtype)
+
+    out = model(pixel_values=x)
+    if hasattr(out, "pooler_output") and out.pooler_output is not None:
+        feat = out.pooler_output
+    else:
+        feat = out.last_hidden_state[:, 0]
+    return feat
+
 def train_one_epoch(
     transformer,
     bolt_layers: BoltReferenceAttentionLayers,
@@ -233,11 +304,21 @@ def train_one_epoch(
     latents_mean=None,
     latents_std=None,
     choice_idx_random_min: int = 4,
+    weighting_scheme: str = "none",
+    loss_w_ema_beta: float = 0.95,
+    optimize_target: str = "mse",
+    id_loss_lambda: float = 0.0,
+    id_dino_encoder: DINOv2 | None = None,
+    id_loss_max_refs: int = 1,
 ):
     bolt_layers.train()
     transformer.eval()
 
-    total_loss = 0.0
+    total_mse = 0.0
+    total_weighted_loss = 0.0
+    total_id_loss = 0.0
+    total_opt_loss = 0.0
+    ema_loss_w = None
     num_samples = 0
     num_skipped = 0
     optimizer.zero_grad()
@@ -490,7 +571,56 @@ def train_one_epoch(
             model_pred = model_pred[0]
 
         # ── Loss ──
-        loss = F.mse_loss(model_pred, target_flow) / grad_accum_steps
+        # Keep optimization target unchanged (plain MSE), and additionally log
+        # a train_helios-style weighted flow loss for trend comparability.
+        mse = F.mse_loss(model_pred, target_flow)
+        weighting = compute_loss_weighting_for_sd3(
+            weighting_scheme=weighting_scheme,
+            sigmas=sigma_t,
+        )
+        weighted_flow_loss = torch.mean(
+            (weighting.float() * (model_pred.float() - target_flow.float()) ** 2).reshape(target_flow.shape[0], -1),
+            dim=1,
+        ).mean()
+        if ema_loss_w is None:
+            ema_loss_w = float(weighted_flow_loss.item())
+        else:
+            ema_loss_w = float(loss_w_ema_beta) * float(ema_loss_w) + (1.0 - float(loss_w_ema_beta)) * float(
+                weighted_flow_loss.item()
+            )
+        id_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        if id_loss_lambda > 0.0 and id_dino_encoder is not None and len(selected_latents) > 0:
+            try:
+                # flow model predicts v=noise-x => x_hat=noise-v
+                pred_clean_latent = noise - model_pred
+                pred_frame = _decode_middle_frame_tensor(
+                    pred_clean_latent, vae, latents_mean, latents_std
+                )  # differentiable path
+
+                ref_frames = []
+                max_refs = max(1, int(id_loss_max_refs))
+                for sl in selected_latents[:max_refs]:
+                    if not isinstance(sl, torch.Tensor):
+                        continue
+                    ref_lat = sl
+                    if ref_lat.ndim == 4:
+                        ref_lat = ref_lat.unsqueeze(0)
+                    ref_frame = _decode_middle_frame_tensor(ref_lat, vae, latents_mean, latents_std)
+                    ref_frames.append(ref_frame.detach())
+
+                if len(ref_frames) > 0:
+                    ref_frame = torch.cat(ref_frames, dim=0).mean(dim=0, keepdim=True)
+                    pred_feat = _dino_forward_on_frames(pred_frame, id_dino_encoder)
+                    ref_feat = _dino_forward_on_frames(ref_frame, id_dino_encoder).detach()
+                    id_loss = (1.0 - F.cosine_similarity(pred_feat.float(), ref_feat.float(), dim=-1)).mean()
+            except Exception as exc:  # noqa: BLE001
+                if step % 20 == 0:
+                    print(f"[WARN] id_loss compute failed at step={step}: {exc}")
+                id_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+
+        primary_obj = weighted_flow_loss if str(optimize_target).lower() in {"weighted", "loss_w"} else mse
+        total_obj = primary_obj + float(id_loss_lambda) * id_loss
+        loss = total_obj / grad_accum_steps
         loss.backward()
 
         if (step + 1) % grad_accum_steps == 0:
@@ -500,7 +630,10 @@ def train_one_epoch(
             # P0: γ 硬 clamp，防 outlier 通道跑飞（|γ|_max > 0.4 已实证不安全）
             bolt_layers.clamp_gamma(-0.4, 0.4)
 
-        total_loss += loss.item() * grad_accum_steps
+        total_mse += float(mse.item())
+        total_weighted_loss += float(weighted_flow_loss.item())
+        total_id_loss += float(id_loss.item())
+        total_opt_loss += float(total_obj.item())
         num_samples += 1
 
         # ── 监控 LayerScale γ / 权重位移 / 注意力分布 / 有效注入比 r ──
@@ -508,7 +641,10 @@ def train_one_epoch(
         # S4: r ∈ [0.05, 0.2] 表示 Ref-Attn 正常侵入 DiT
         # 内在收敛信号: H_attn 单调下降 + dW_rel 单调上升 + Δmse(S5) < 0
         stats = bolt_layers.collect_stats()
-        avg_loss = total_loss / num_samples
+        avg_mse = total_mse / num_samples
+        avg_weighted_loss = total_weighted_loss / num_samples
+        avg_id_loss = total_id_loss / num_samples
+        avg_opt_loss = total_opt_loss / num_samples
 
         # ── S5: 每 50 step 临时置 γ=0 跑一次 forward，对比 Δmse(γ vs γ=0) ──
         # 这是与 timestep 噪声解耦的"Ref-Attn 是否真的在帮"判据。
@@ -545,7 +681,7 @@ def train_one_epoch(
             finally:
                 for m, g in zip(bolt_layers.ref_attn_modules.values(), saved_gammas):
                     m.gamma.data.copy_(g)
-            mse_gamma = loss.item() * grad_accum_steps
+            mse_gamma = float(mse.item())
             delta_mse = mse_gamma - mse_gamma0
             s5_log = (
                 f"  [S5 step={step+1}] mse(γ)={mse_gamma:.5f}, "
@@ -555,8 +691,13 @@ def train_one_epoch(
             torch.cuda.empty_cache()
 
         pbar.set_postfix({
-            "mse": f"{loss.item()*grad_accum_steps:.4f}",
-            "avg": f"{avg_loss:.4f}",
+            "mse": f"{mse.item():.4f}",
+            "avg_mse": f"{avg_mse:.4f}",
+            "loss_w": f"{weighted_flow_loss.item():.4f}",
+            "avg_loss_w": f"{avg_weighted_loss:.4f}",
+            "loss_w_ema": f"{ema_loss_w:.4f}",
+            "id_loss": f"{id_loss.item():.4f}",
+            "opt_loss": f"{total_obj.item():.4f}",
             "|γ|": f"{stats['gamma_abs_mean']:.4f}",
             "|γ|max": f"{stats['gamma_abs_max']:.4f}",
             "r": f"{stats['r_mean']:.3f}",
@@ -570,8 +711,14 @@ def train_one_epoch(
 
         if (step + 1) % 50 == 0:
             print(
-                f"\n  [Step {step+1}] mse={loss.item()*grad_accum_steps:.6f}, "
-                f"avg={avg_loss:.6f}, "
+                f"\n  [Step {step+1}] mse={mse.item():.6f}, "
+                f"avg_mse={avg_mse:.6f}, "
+                f"loss_w={weighted_flow_loss.item():.6f}, "
+                f"avg_loss_w={avg_weighted_loss:.6f}, "
+                f"loss_w_ema={ema_loss_w:.6f}, "
+                f"id_loss={id_loss.item():.6f}, "
+                f"avg_id_loss={avg_id_loss:.6f}, "
+                f"avg_opt_loss={avg_opt_loss:.6f}, "
                 f"|γ|_mean={stats['gamma_abs_mean']:.5f}, "
                 f"|γ|_max={stats['gamma_abs_max']:.5f}, "
                 f"r_mean={stats['r_mean']:.4f}, "
@@ -590,7 +737,7 @@ def train_one_epoch(
                 print(s5_log)
 
         # 清理显存
-        del model_pred, loss, noisy_input, target_flow, noise
+        del model_pred, mse, weighted_flow_loss, id_loss, total_obj, loss, noisy_input, target_flow, noise
         torch.cuda.empty_cache()
 
     # 处理最后一批未对齐 grad_accum_steps 的残余梯度
@@ -600,8 +747,17 @@ def train_one_epoch(
         optimizer.zero_grad()
         bolt_layers.clamp_gamma(-0.4, 0.4)
 
-    avg = total_loss / max(num_samples, 1)
-    return avg
+    avg_mse = total_mse / max(num_samples, 1)
+    avg_weighted_loss = total_weighted_loss / max(num_samples, 1)
+    avg_id_loss = total_id_loss / max(num_samples, 1)
+    avg_opt_loss = total_opt_loss / max(num_samples, 1)
+    return {
+        "avg_mse": float(avg_mse),
+        "avg_weighted_loss": float(avg_weighted_loss),
+        "avg_id_loss": float(avg_id_loss),
+        "avg_opt_loss": float(avg_opt_loss),
+        "loss_w_ema_last": float(0.0 if ema_loss_w is None else ema_loss_w),
+    }
 
 
 @torch.no_grad()
@@ -623,6 +779,7 @@ def evaluate_flow_matching_avg_mse(
     choice_idx_random_min: int = 4,
     seed: int = 42,
     max_batches: int = 0,
+    weighting_scheme: str = "none",
 ):
     """与训练目标一致的验证：仅计算 Flow Matching MSE（不反传）。"""
     bolt_layers.eval()
@@ -630,6 +787,7 @@ def evaluate_flow_matching_avg_mse(
     np.random.seed(int(seed))
 
     total_mse = 0.0
+    total_weighted_loss = 0.0
     num_samples = 0
     num_skipped = 0
     gen = torch.Generator(device=device).manual_seed(int(seed))
@@ -786,12 +944,23 @@ def evaluate_flow_matching_avg_mse(
         if isinstance(model_pred, tuple):
             model_pred = model_pred[0]
         mse = F.mse_loss(model_pred.float(), target_flow.float()).item()
+        weighting = compute_loss_weighting_for_sd3(
+            weighting_scheme=weighting_scheme,
+            sigmas=sigma_t,
+        )
+        weighted_loss = torch.mean(
+            (weighting.float() * (model_pred.float() - target_flow.float()) ** 2).reshape(target_flow.shape[0], -1),
+            dim=1,
+        ).mean().item()
         total_mse += float(mse)
+        total_weighted_loss += float(weighted_loss)
         num_samples += 1
 
     avg = total_mse / max(num_samples, 1)
+    avg_weighted = total_weighted_loss / max(num_samples, 1)
     return {
         "avg_mse": float(avg),
+        "avg_weighted_loss": float(avg_weighted),
         "num_samples": int(num_samples),
         "num_skipped": int(num_skipped),
     }
@@ -1409,6 +1578,8 @@ def validate_epoch(
     if not videos_to_generate:
         print("  [VAL] No validation prompts configured, skipping.")
         bolt_layers.train()
+        # Keep training path stable: decode_middle_frame in training expects VAE on CPU.
+        vae.to("cpu", dtype=torch.float32)
         # 清理 pipeline 引用 (不 del transformer/vae，它们是外部传入的)
         del pipe, scheduler
         torch.cuda.empty_cache()
@@ -1513,6 +1684,9 @@ def validate_epoch(
         record_stream=True,
     )
     print("  [VAL] Restored training group offload on transformer.")
+    # Validation may move VAE to CUDA via pipeline; move it back for training decode path.
+    vae.to("cpu", dtype=torch.float32)
+    torch.cuda.empty_cache()
 
 
 # ═══════════════════════════════════════════
@@ -1534,6 +1708,7 @@ def load_config_from_yaml(yaml_path):
 
     model = cfg.get("model_config", {})
     flat["transformer_path"] = model.get("transformer_path", "/root/autodl-fs/BestWishYSH/Helios-Base")
+    flat["base_model_path"] = model.get("base_model_path", None)
     flat["clip_model_path"] = model.get("clip_model_path", None)
 
     bolt = cfg.get("bolt_config", {})
@@ -1552,6 +1727,12 @@ def load_config_from_yaml(yaml_path):
     flat["lr_gamma"] = train.get("lr_gamma", 1e-2)
     flat["grad_accum_steps"] = train.get("grad_accum_steps", 2)
     flat["max_grad_norm"] = train.get("max_grad_norm", 1.0)
+    flat["weighting_scheme"] = train.get("weighting_scheme", "none")
+    flat["loss_w_ema_beta"] = float(train.get("loss_w_ema_beta", 0.95))
+    flat["optimize_target"] = str(train.get("optimize_target", "mse"))
+    flat["id_loss_lambda"] = float(train.get("id_loss_lambda", 0.0))
+    flat["id_loss_max_refs"] = int(train.get("id_loss_max_refs", 1))
+    flat["id_dino_model_path"] = train.get("id_dino_model_path", None)
     flat["save_every"] = train.get("save_every", 5)
     flat["resume_from"] = train.get("resume_from", None)
     # 约 7 chunk、三幕结构时第三幕常从 chunk>=4；训练随机 target 仅从此下界起抽（不足则退回 2..）
@@ -1561,8 +1742,8 @@ def load_config_from_yaml(yaml_path):
     # Validation config (保持为 dict，不展平)
     val = cfg.get("validation_config", {})
     if val:
-        # base_model_path 默认与 transformer_path 一致
-        val.setdefault("base_model_path", flat["transformer_path"])
+        # validation 的 base_model_path 默认使用 model_config.base_model_path（若有），否则退回 transformer_path
+        val.setdefault("base_model_path", flat["base_model_path"] or flat["transformer_path"])
         flat["validation_config"] = val
     else:
         flat["validation_config"] = None
@@ -1762,6 +1943,40 @@ def main():
         choices=["bfloat16", "fp16", "fp32"],
         help="部分模块权重/计算精度（如 DINO 侧 fp16/bf16）；与 DiT dtype 可独立。",
     )
+    parser.add_argument(
+        "--weighting_scheme",
+        default=None,
+        help="Flow loss weighting scheme (aligned with train_helios.py).",
+    )
+    parser.add_argument(
+        "--optimize_target",
+        choices=["mse", "weighted", "loss_w"],
+        default=None,
+        help="Primary objective for backprop: mse or weighted/loss_w.",
+    )
+    parser.add_argument(
+        "--id_loss_lambda",
+        type=float,
+        default=None,
+        help="Lambda for ID consistency loss. Set >0 to enable L_id.",
+    )
+    parser.add_argument(
+        "--id_loss_max_refs",
+        type=int,
+        default=None,
+        help="Max number of selected reference chunks used to build ID target frame.",
+    )
+    parser.add_argument(
+        "--id_dino_model_path",
+        default=None,
+        help="DINOv2 model path for ID loss; defaults to --dino_model_path when unset.",
+    )
+    parser.add_argument(
+        "--loss_w_ema_beta",
+        type=float,
+        default=None,
+        help="EMA smoothing beta for loss_w logging (0~1, closer to 1 = smoother).",
+    )
     cli_args = parser.parse_args()
 
     # ── 合并配置: yaml 为底，CLI 覆盖 ──
@@ -1807,6 +2022,12 @@ def main():
         "lm_debug": False,
         "bolt_log_every_chunk": False,
         "weight_dtype": "bfloat16",
+        "weighting_scheme": "none",
+        "optimize_target": "mse",
+        "id_loss_lambda": 0.0,
+        "id_loss_max_refs": 1,
+        "id_dino_model_path": None,
+        "loss_w_ema_beta": 0.95,
     }
 
     if cli_args.config:
@@ -1903,6 +2124,17 @@ def main():
     clip_model.model.to(dtype=torch.float32, device="cpu")
     clip_model.device = "cpu"
     torch.cuda.empty_cache()
+
+    # ── Optional: DINO encoder for ID consistency loss ──
+    id_dino_encoder = None
+    if float(getattr(args, "id_loss_lambda", 0.0) or 0.0) > 0.0:
+        id_dino_path = args.id_dino_model_path or args.dino_model_path
+        if not id_dino_path:
+            raise ValueError("id_loss_lambda > 0 requires --id_dino_model_path or --dino_model_path")
+        print(f"[INFO] Loading DINOv2 for id loss from: {id_dino_path}")
+        id_dino_encoder = DINOv2(device=device, model_id_or_path=id_dino_path, dtype=args.weight_dtype)
+        id_dino_encoder.model.requires_grad_(False)
+        id_dino_encoder.model.eval()
 
     # ── Optional: VLM selector backbone ──
     vlm_selector = None
@@ -2028,6 +2260,13 @@ def main():
     print(f"  BOLT Reference Attention Training")
     print(f"  Active layers: {active_layers[0]}-{active_layers[-1]}")
     print(f"  Epochs: {args.num_epochs}, LR(W): {args.bolt_lr}, LR(γ): {lr_gamma}")
+    print(f"  weighting_scheme: {args.weighting_scheme}")
+    print(f"  optimize_target: {args.optimize_target}")
+    print(f"  loss_w_ema_beta: {args.loss_w_ema_beta}")
+    print(
+        f"  id_loss_lambda: {args.id_loss_lambda} "
+        f"(max_refs={args.id_loss_max_refs}, dino={args.id_dino_model_path or args.dino_model_path})"
+    )
     print(f"  selector_type: {args.selector_type}")
     if args.selector_type == "vlm":
         _vk = args.vlm_k_select if args.vlm_k_select is not None else args.bolt_k_select
@@ -2074,9 +2313,11 @@ def main():
                 choice_idx_random_min=args.choice_idx_random_min,
                 seed=val_fm_seed + 100000,
                 max_batches=val_fm_max_batches,
+                weighting_scheme=args.weighting_scheme,
             )
             print(
-                f"[VAL][FM] epoch=-1 val_avg_mse={fm_stats['avg_mse']:.6f} "
+                f"[VAL][FM] epoch=-1 val_avg_mse={fm_stats['avg_mse']:.6f}, "
+                f"val_avg_loss_w={fm_stats['avg_weighted_loss']:.6f} "
                 f"(samples={fm_stats['num_samples']}, skipped={fm_stats['num_skipped']})"
             )
             validate_epoch(
@@ -2104,7 +2345,7 @@ def main():
 
     for epoch in range(args.num_epochs):
         t0 = time.time()
-        avg_loss = train_one_epoch(
+        train_stats = train_one_epoch(
             transformer, bolt_layers, clip_model, vlm_selector, vae, dataloader, optimizer, epoch,
             device=device, dtype=dtype,
             grad_accum_steps=args.grad_accum_steps,
@@ -2115,9 +2356,21 @@ def main():
             latents_mean=latents_mean,
             latents_std=latents_std,
             choice_idx_random_min=args.choice_idx_random_min,
+            weighting_scheme=args.weighting_scheme,
+            loss_w_ema_beta=args.loss_w_ema_beta,
+            optimize_target=args.optimize_target,
+            id_loss_lambda=args.id_loss_lambda,
+            id_dino_encoder=id_dino_encoder,
+            id_loss_max_refs=args.id_loss_max_refs,
         )
         dt = time.time() - t0
-        print(f"[Epoch {epoch}] avg_mse={avg_loss:.6f}, time={dt:.1f}s")
+        print(
+            f"[Epoch {epoch}] avg_mse={train_stats['avg_mse']:.6f}, "
+            f"avg_loss_w={train_stats['avg_weighted_loss']:.6f}, "
+            f"avg_id_loss={train_stats['avg_id_loss']:.6f}, "
+            f"avg_opt_loss={train_stats['avg_opt_loss']:.6f}, "
+            f"loss_w_ema_last={train_stats['loss_w_ema_last']:.6f}, time={dt:.1f}s"
+        )
 
         if (epoch + 1) % args.save_every == 0:
             ckpt_path = os.path.join(args.output_dir, f"bolt_ref_attn_epoch{epoch:03d}.pth")
@@ -2144,9 +2397,11 @@ def main():
                     choice_idx_random_min=args.choice_idx_random_min,
                     seed=val_fm_seed + epoch,
                     max_batches=val_fm_max_batches,
+                    weighting_scheme=args.weighting_scheme,
                 )
                 print(
-                    f"[VAL][FM] epoch={epoch} val_avg_mse={fm_stats['avg_mse']:.6f} "
+                    f"[VAL][FM] epoch={epoch} val_avg_mse={fm_stats['avg_mse']:.6f}, "
+                    f"val_avg_loss_w={fm_stats['avg_weighted_loss']:.6f} "
                     f"(samples={fm_stats['num_samples']}, skipped={fm_stats['num_skipped']})"
                 )
                 validate_epoch(

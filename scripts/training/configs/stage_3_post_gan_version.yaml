@@ -1,11 +1,11 @@
-output_dir: ablation_stage_3_post_gan_version
-logging_dir: logs
+output_dir: /root/autodl-fs/output/ablation_stage_3_post_gan_smoke_test
+logging_dir: /root/autodl-fs/output/ablation_stage_3_post_gan_smoke_test/logs
 seed: 49
 
 
 report_to:
   tracker_name: Wan-Train
-  wandb_name: ablation_stage_3_post_gan_version
+  wandb_name: /root/autodl-fs/output/ablation_stage_3_post_gan_smoke_test
   report_to: wandb
 
 
@@ -18,7 +18,7 @@ data_config:
   single_res: true
   single_height: 384
   single_width: 640
-  dataloader_num_workers: 8
+  dataloader_num_workers: 2 #8
   prefetch_factor: 1
   caption_dropout_p: 0
   id_token: ""
@@ -27,15 +27,15 @@ data_config:
   # ---- Stage 3 ----
   use_stage3_dataset: true
   gan_data_root:
-    - "demo_data/ultravideo-long"
+    - "/root/autodl-fs/HeliosBench-Weights/demo_data/ultravideo-long"
 
 
 model_config:
   # ---- Path ----
-  pretrained_model_name_or_path: "BestWishYsh/Helios-Base"
-  transformer_model_name_or_path: "BestWishYsh/Helios-Distilled"
-  subfolder: "transformer_ode"
-  real_score_model_name_or_path: "BestWishYsh/Helios-Base"
+  pretrained_model_name_or_path: "/root/autodl-fs/BestWishYSH/Helios-Base"
+  transformer_model_name_or_path: "/root/autodl-fs/output/ablation_stage_3_ode_smoke_test/merged"
+  # subfolder 不需要了，因为 merged 目录下直接就是 transformer/
+  real_score_model_name_or_path: "/root/autodl-fs/BestWishYSH/Helios-Base"
   load_checkpoints_custom: false
   # load_model_path:
   load_dcp: false
@@ -45,7 +45,7 @@ model_config:
   enable_slicing: false
   enable_tiling: false
   # ---- Lora ----
-  lora_rank: 256
+  lora_rank: 32    #256
   lora_alpha: 256.0
   lora_dropout: 0.0
   lora_layers: "all-linear"
@@ -62,27 +62,25 @@ model_config:
   # ---- Other ----
   train_norm_layers: false
   # ---- DMD ----
-  critic_lora_rank: 256
+  critic_lora_rank: 32    #256
   critic_lora_alpha: 256.0
   critic_lora_dropout: 0.0
   # ---- Reward Parameters ----
-  reward_model_name_or_path: "/mnt/bn/yufan-dev-my/ysh_new/Ckpts/Videoreward"
+  # reward_model_name_or_path: "/mnt/bn/yufan-dev-my/ysh_new/Ckpts/Videoreward"  # 注释掉，smoke test 不需要
 
 
 validation_config:
-  validation_steps: 500
+  validation_steps: 25 #500
   validation_height: 384
   validation_width: 640
   validation_max_num_frames: 99
   validation_prompts:
     - "A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about."
-    # - "Several giant wooly mammoths approach treading through a snowy meadow, their long wooly fur lightly blows in the wind as they walk, snow covered trees and dramatic snow capped mountains in the distance, mid afternoon light with wispy clouds and a sun high in the distance creates a warm glow, the low camera view is stunning capturing the large furry mammal with beautiful photography, depth of field."
-    # - "A movie trailer featuring the adventures of the 30 year old space man wearing a red wool knitted motorcycle helmet, blue sky, salt desert, cinematic style, shot on 35mm film, vivid colors."
   validation_guidance_scale: 1.0
   validation_latent_window_size:
     - 9
   num_validation_videos: 1
-  num_inference_steps: 6
+  num_inference_steps: 3  #6
   # ---- Pyramid ----
   stage2_simulated_inference_steps:
     - 2
@@ -100,16 +98,16 @@ training_config:
   offload: false
   mixed_precision: "bf16"
   # ---- Training Resource ----
-  max_train_steps: 1000000
+  max_train_steps: 100  #1000000
   train_batch_size: 1
   gradient_accumulation_steps: 1
-  checkpointing_steps: 250
+  checkpointing_steps: 25  #250
   resume_from_checkpoint: "latest"
   save_checkpoints_custom: false
   # ---- Optimizer ----
   learning_rate: 2.0e-06
   lr_scheduler: "constant"
-  lr_warmup_steps: 500
+  lr_warmup_steps: 10  #500
   optimizer: "adamw"
   adam_beta1: 0.0
   adam_beta2: 0.999
@@ -132,7 +130,7 @@ training_config:
   use_ema: true
   use_ema_validation: false
   ema_decay: 0.99
-  ema_start_step: 750
+  ema_start_step: 10  #750
   ema_zero3_port: 10543
   ema_deepspeed_config_file: "scripts/accelerate_configs/zero3.json"
   # ---- Stage 1 Parameters ----
@@ -142,16 +140,7 @@ training_config:
     - 2
     - 1
   latent_window_size:
-    # - 12
-    # - 10
     - 9
-    # - 8
-    # - 6
-    # - 5
-    # - 4
-    # - 3
-    # - 2
-    # - 1
   is_random_drop: true
   random_drop_v2v_ratio: 0.5
   random_drop_t2v_ratio: 0.4
@@ -217,7 +206,7 @@ training_config:
   is_gan_low_vram_mode: true
   dmd_is_offload_grad: false
   # ---- Stage 3 Parameters ----
-  log_iters: 125
+  log_iters: 10  #125
   no_visualize: false
   is_train_dmd: true
   max_grad_norm_critic: 10.0
@@ -248,7 +237,7 @@ training_config:
   is_amplify_first_chunk: true
   # ---- GAN Parameters ----
   is_use_gan: true
-  gan_start_step: 1000
+  gan_start_step: 20  #1000
   is_separate_gan_grad: false
   is_use_gan_hooks: true
   is_use_gan_final: true
@@ -275,22 +264,22 @@ training_config:
   generator_dynamic_alpha: 4.0
   generator_dynamic_beta: 1.5
   generator_dynamic_sample_type: "beta"
-  generator_dynamic_step: 500
+  generator_dynamic_step: 50  #500
   critic_dynamic_alpha: 4.0
   critic_dynamic_beta: 1.5
   critic_dynamic_sample_type: "uniform"
-  critic_dynamic_step: 500
+  critic_dynamic_step: 50  #500
   # ---- Dynamic DMD Section ----
   dmd_num_latent_sections_min: 1
   dmd_num_latent_sections_max: 1
   dmd_dynamic_alpha: 1.5
   dmd_dynamic_beta: 4.0
   dmd_dynamic_sample_type: "uniform"
-  dmd_dynamic_step: 500
+  dmd_dynamic_step: 50  #500
   # ---- Dynamic ODE Section ----
   ode_num_latent_sections_min: 3
   ode_num_latent_sections_max: 3
   ode_dynamic_alpha: 1.5
   ode_dynamic_beta: 4.0
   ode_dynamic_sample_type: "uniform"
-  ode_dynamic_step: 500
+  ode_dynamic_step: 50  #500

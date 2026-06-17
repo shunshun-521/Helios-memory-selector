@@ -96,34 +96,162 @@ def detect_scenes_transnetv2(video_path: str, threshold: float, device: str, dur
     return ensure_monotonic_segments(segs, duration_sec)
 
 
+def _build_temporal_segments(segments_sec: List[Tuple[float, float]], duration: float) -> List[Dict[str, Any]]:
+    segs = ensure_monotonic_segments(segments_sec, duration)
+    return [
+        {
+            "start_sec": float(s),
+            "end_sec": float(e),
+            "prompt": "",
+        }
+        for s, e in segs
+    ]
+
+
+def _concat_prompts(prev_prompt: str, cur_prompt: str) -> str:
+    prev = (prev_prompt or "").strip()
+    cur = (cur_prompt or "").strip()
+    if prev and cur:
+        return f"{prev} {cur}"
+    return prev or cur
+
+
+def _assign_chunk_owners_by_center(
+    segments: List[Dict[str, Any]],
+    fps: float,
+    num_frames: int,
+    ch_frames: int,
+) -> List[int]:
+    n_chunks = max(1, int(math.ceil(num_frames / float(ch_frames))))
+    owners: List[int] = []
+    for chunk_idx in range(n_chunks):
+        frame_lo = int(chunk_idx * ch_frames)
+        frame_hi = int(min((chunk_idx + 1) * ch_frames, num_frames) - 1)
+        frame_hi = max(frame_hi, frame_lo)
+        center_t = 0.5 * (frame_lo + frame_hi) / float(fps)
+
+        owner = None
+        for seg_idx, seg in enumerate(segments):
+            s = float(seg["start_sec"])
+            e = float(seg["end_sec"])
+            is_last = seg_idx == (len(segments) - 1)
+            if (s <= center_t < e) or (is_last and s <= center_t <= e):
+                owner = seg_idx
+                break
+
+        if owner is None:
+            if center_t < float(segments[0]["start_sec"]):
+                owner = 0
+            else:
+                owner = len(segments) - 1
+                for seg_idx in range(1, len(segments)):
+                    if center_t < float(segments[seg_idx]["start_sec"]):
+                        owner = seg_idx - 1
+                        break
+
+        owners.append(int(owner))
+    return owners
+
+
+def _merge_zero_chunk_segments_into_neighbors(
+    segments: List[Dict[str, Any]],
+    owners: List[int],
+    min_len_chunks: int,
+) -> Tuple[List[Dict[str, Any]], List[int]]:
+    segments = [dict(x) for x in segments]
+    owners = [int(x) for x in owners]
+
+    i = 0
+    while i < len(segments):
+        counts = [0] * len(segments)
+        for o in owners:
+            counts[o] += 1
+
+        if len(segments) == 1:
+            break
+        if counts[i] >= int(min_len_chunks):
+            i += 1
+            continue
+
+        if i > 0:
+            segments[i - 1]["end_sec"] = max(float(segments[i - 1]["end_sec"]), float(segments[i]["end_sec"]))
+            segments[i - 1]["prompt"] = _concat_prompts(segments[i - 1].get("prompt", ""), segments[i].get("prompt", ""))
+            for k, o in enumerate(owners):
+                if o == i:
+                    owners[k] = i - 1
+                elif o > i:
+                    owners[k] = o - 1
+            segments.pop(i)
+            i = max(i - 1, 0)
+        else:
+            segments[1]["start_sec"] = min(float(segments[0]["start_sec"]), float(segments[1]["start_sec"]))
+            segments[1]["prompt"] = _concat_prompts(segments[0].get("prompt", ""), segments[1].get("prompt", ""))
+            for k, o in enumerate(owners):
+                if o == 0:
+                    owners[k] = 1
+            for k, o in enumerate(owners):
+                if o > 0:
+                    owners[k] = o - 1
+            segments.pop(0)
+            i = 0
+
+    return segments, owners
+
+
 def align_segments_to_chunks(
-    segments_sec: List[Tuple[float, float]],
+    segments: List[Dict[str, Any]],
     fps: float,
     num_frames: int,
     ch_frames: int,
     min_len_chunks: int,
 ) -> List[Dict[str, Any]]:
-    duration = float(num_frames) / float(fps)
-    segs = ensure_monotonic_segments(segments_sec, duration)
     n_chunks = max(1, int(math.ceil(num_frames / float(ch_frames))))
-    out: List[Dict[str, Any]] = []
+    if not segments:
+        duration = float(num_frames) / float(fps)
+        return [
+            {
+                "start_sec": 0.0,
+                "end_sec": duration,
+                "start_chunk": 0,
+                "end_chunk": n_chunks,
+                "prompt": "",
+            }
+        ]
 
-    for s, e in segs:
-        s_chunk = _clamp(int(math.floor((s * fps) / float(ch_frames))), 0, n_chunks - 1)
-        e_chunk = _clamp(int(math.ceil((e * fps) / float(ch_frames))), s_chunk + 1, n_chunks)
-        if (e_chunk - s_chunk) < int(min_len_chunks):
+    owners = _assign_chunk_owners_by_center(
+        segments=segments,
+        fps=float(fps),
+        num_frames=int(num_frames),
+        ch_frames=int(ch_frames),
+    )
+    segments, owners = _merge_zero_chunk_segments_into_neighbors(
+        segments=segments,
+        owners=owners,
+        min_len_chunks=int(min_len_chunks),
+    )
+
+    counts = [0] * len(segments)
+    for o in owners:
+        counts[o] += 1
+
+    out: List[Dict[str, Any]] = []
+    cursor = 0
+    for seg, count in zip(segments, counts):
+        if count <= 0:
             continue
         out.append(
             {
-                "start_sec": float(s),
-                "end_sec": float(e),
-                "start_chunk": int(s_chunk),
-                "end_chunk": int(e_chunk),
-                "prompt": "",
+                "start_sec": float(seg["start_sec"]),
+                "end_sec": float(seg["end_sec"]),
+                "start_chunk": int(cursor),
+                "end_chunk": int(cursor + count),
+                "prompt": str(seg.get("prompt", "") or ""),
             }
         )
+        cursor += count
 
     if not out:
+        duration = float(num_frames) / float(fps)
         out = [
             {
                 "start_sec": 0.0,
@@ -372,13 +500,7 @@ def main() -> None:
             device=str(args.transnetv2_device),
             duration_sec=float(info.duration_sec),
         )
-        segments = align_segments_to_chunks(
-            seg_sec,
-            fps=float(info.fps),
-            num_frames=max(1, int(info.num_frames)),
-            ch_frames=int(chf),
-            min_len_chunks=int(args.min_len_chunks),
-        )
+        segments = _build_temporal_segments(seg_sec, duration=float(info.duration_sec))
         segments = assign_prompts_visual_batch(
             segments=segments,
             video_path=str(vp),
@@ -386,6 +508,13 @@ def main() -> None:
             captioner=captioner,
             frames_per_segment=int(args.qwen_vl_frames_per_segment),
             max_new_tokens=int(args.qwen_vl_batch_max_new_tokens),
+        )
+        segments = align_segments_to_chunks(
+            segments=segments,
+            fps=float(info.fps),
+            num_frames=max(1, int(info.num_frames)),
+            ch_frames=int(chf),
+            min_len_chunks=int(args.min_len_chunks),
         )
 
         records.append(

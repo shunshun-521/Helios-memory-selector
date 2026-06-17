@@ -115,6 +115,7 @@ def main(
         valid_widths = []
         valid_videos = []
         valid_prompts = []
+        valid_prompt_segments = []
         valid_first_frames_images = []
 
         if batch["uttid"] is None:
@@ -139,6 +140,8 @@ def main(
                 valid_widths.append(width)
                 valid_videos.append(batch["videos"][i])
                 valid_prompts.append(batch["prompts"][i])
+                if "prompt_segments" in batch:
+                    valid_prompt_segments.append(batch["prompt_segments"][i])
                 valid_first_frames_images.append(batch["first_frames_images"][i])
             else:
                 print(f"skipping {uttid}")
@@ -159,6 +162,7 @@ def main(
             "video_metadata": {"num_frames": valid_num_frames, "height": valid_heights, "width": valid_widths},
             "videos": torch.stack(valid_videos),
             "prompts": valid_prompts,
+            "prompt_segments": valid_prompt_segments if len(valid_prompt_segments) == len(valid_prompts) else None,
             "first_frames_images": torch.stack(valid_first_frames_images),
         }
 
@@ -188,17 +192,62 @@ def main(
 
             # Encode prompts
             prompts = batch["prompts"]
-            prompt_embeds, prompt_attention_mask = encode_prompt(
-                tokenizer=tokenizer,
-                text_encoder=text_encoder,
-                prompt=prompts,
-                device=device,
-            )
+            prompt_segments = batch.get("prompt_segments", None)
+
+            # Default (legacy): single prompt per video
+            prompt_embeds = None
+            prompt_attention_mask = None
+            prompt_embeds_by_segment = None  # list[Tensor(N_seg,S,D)] per sample
+            segments_to_save = None  # list[list[dict]] per sample
+
+            # New: chunk-aligned segments (from Selector_VLM metadata).
+            # We encode per-segment prompts, and also keep a legacy `prompt_embed` by taking segment[0].
+            if (
+                prompt_segments is not None
+                and isinstance(prompt_segments, list)
+                and len(prompt_segments) == len(prompts)
+                and any(s is not None for s in prompt_segments)
+            ):
+                prompt_embeds_by_segment = []
+                segments_to_save = []
+                for segs in prompt_segments:
+                    if not isinstance(segs, list) or len(segs) == 0:
+                        seg_prompts = [""]
+                        seg_bounds = [(0, 10**9)]
+                    else:
+                        seg_prompts = [str(x.get("prompt", "") or "") for x in segs]
+                        seg_bounds = [
+                            (int(x.get("start_chunk", 0) or 0), int(x.get("end_chunk", 0) or 0)) for x in segs
+                        ]
+
+                    seg_embeds, _ = encode_prompt(
+                        tokenizer=tokenizer,
+                        text_encoder=text_encoder,
+                        prompt=seg_prompts,
+                        device=device,
+                    )
+                    prompt_embeds_by_segment.append(seg_embeds)
+                    segments_to_save.append(
+                        [
+                            {"start_chunk": sc, "end_chunk": ec, "prompt_raw": pr}
+                            for (sc, ec), pr in zip(seg_bounds, seg_prompts)
+                        ]
+                    )
+
+                prompt_embeds = torch.stack([x[0] for x in prompt_embeds_by_segment], dim=0)
+                prompt_attention_mask = [None] * len(prompts)
+            else:
+                prompt_embeds, prompt_attention_mask = encode_prompt(
+                    tokenizer=tokenizer,
+                    text_encoder=text_encoder,
+                    prompt=prompts,
+                    device=device,
+                )
 
             image_tensor = batch["first_frames_images"]
             images = [transforms.ToPILImage()(x.to(torch.uint8)) for x in image_tensor]
 
-        for (
+        for j, (
             uttid,
             num_frame,
             height,
@@ -208,7 +257,7 @@ def main(
             cur_prompt_attention_mask,
             cur_first_frames_image,
             cur_prompt,
-        ) in zip(
+        ) in enumerate(zip(
             batch["uttid"],
             batch["video_metadata"]["num_frames"],
             batch["video_metadata"]["height"],
@@ -218,7 +267,7 @@ def main(
             prompt_attention_mask,
             images,
             prompts,
-        ):
+        )):
             output_path = os.path.join(output_latent_folder, f"{uttid}_{num_frame}_{height}_{width}.pt")
             temp_to_save = {
                 "vae_latent": cur_vae_latent.cpu().detach(),
@@ -227,6 +276,9 @@ def main(
                 "first_frames_image": cur_first_frames_image,
                 "prompt_raw": cur_prompt,
             }
+            if prompt_embeds_by_segment is not None and segments_to_save is not None:
+                temp_to_save["prompt_embeds_by_segment"] = prompt_embeds_by_segment[j].cpu().detach()
+                temp_to_save["segments"] = segments_to_save[j]
             try:
                 torch.save(temp_to_save, output_path)
             except Exception:
@@ -286,6 +338,13 @@ if __name__ == "__main__":
         default="BestWishYsh/Helios-Base",
         help="Pretrained model path",
     )
+    # Allow overriding hardcoded paths for quick single-sample runs
+    parser.add_argument("--json_file", type=str, default=None, help="Path to metadata json (list).")
+    parser.add_argument("--video_folder", type=str, default=None, help="Folder containing videos referenced by metadata.")
+    parser.add_argument("--output_latent_folder", type=str, default=None, help="Output folder for .pt latents.")
+    parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--resolution", type=int, default=640)
     args = parser.parse_args()
 
     setup_distributed_env()
@@ -295,47 +354,63 @@ if __name__ == "__main__":
     device = torch.cuda.current_device()
     world_size = dist.get_world_size()
 
-    base_video_path = "example"
-    video_paths = [
-        "toy_data",
-    ]
-
-    base_output_latent_path = "example/toy_data/latents_short"
-    output_latent_paths = [
-        "toy_data",
-    ]
-
-    base_csv_paths = [
-        "example",
-    ]
-    csv_paths = [
-        "toy_data/toy_filter.json",
-    ]
-
-    resolutions = [640]
-    strides = [1]
-    batch_sizes = [4]
-
-    for stride, batch_size, base_csv_path, csv_path, video_path, output_latent_path, cur_resolution in zip(
-        strides, batch_sizes, base_csv_paths, csv_paths, video_paths, output_latent_paths, resolutions
-    ):
-        json_file = os.path.join(base_csv_path, csv_path)
-        video_folder = os.path.join(base_video_path, video_path)
-        output_latent_folder = os.path.join(base_output_latent_path, output_latent_path)
-
+    if args.json_file is not None and args.video_folder is not None and args.output_latent_folder is not None:
         main(
             rank=device,
             world_size=world_size,
             global_rank=global_rank,
-            stride=stride,
-            batch_size=batch_size,
+            stride=args.stride,
+            batch_size=args.batch_size,
             dataloader_num_workers=args.dataloader_num_workers,
-            json_file=json_file,
-            video_folder=video_folder,
-            output_latent_folder=output_latent_folder,
+            json_file=args.json_file,
+            video_folder=args.video_folder,
+            output_latent_folder=args.output_latent_folder,
             pretrained_model_name_or_path=args.pretrained_model_name_or_path,
-            resolution=cur_resolution,
+            resolution=args.resolution,
         )
+    else:
+        # Legacy hardcoded paths
+        base_video_path = "/root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/example_long_only"
+        video_paths = [
+            "video",
+        ]
+
+        base_output_latent_path = "/root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/example_long_only"
+        output_latent_paths = [
+            "latents_short",
+        ]
+
+        base_csv_paths = [
+            "/root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/example_long_only",
+        ]
+        csv_paths = [
+            "sample_00001.json",
+        ]
+
+        resolutions = [640]
+        strides = [1]
+        batch_sizes = [4]
+
+        for stride, batch_size, base_csv_path, csv_path, video_path, output_latent_path, cur_resolution in zip(
+            strides, batch_sizes, base_csv_paths, csv_paths, video_paths, output_latent_paths, resolutions
+        ):
+            json_file = os.path.join(base_csv_path, csv_path)
+            video_folder = os.path.join(base_video_path, video_path)
+            output_latent_folder = os.path.join(base_output_latent_path, output_latent_path)
+
+            main(
+                rank=device,
+                world_size=world_size,
+                global_rank=global_rank,
+                stride=stride,
+                batch_size=batch_size,
+                dataloader_num_workers=args.dataloader_num_workers,
+                json_file=json_file,
+                video_folder=video_folder,
+                output_latent_folder=output_latent_folder,
+                pretrained_model_name_or_path=args.pretrained_model_name_or_path,
+                resolution=cur_resolution,
+            )
 
     dist.barrier()
     dist.destroy_process_group()

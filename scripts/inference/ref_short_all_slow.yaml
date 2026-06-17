@@ -1,0 +1,25 @@
+training_config:
+  use_ref_short: true
+  ref_frames_per_chunk: 3
+  history_sizes: [16, 2, 1]
+  latent_window_size: [9]
+
+selector_inference:
+  # 全程 slow：每个 chunk 都强制走 slow 路径（等价于每步当作 cut）
+  selector_force_slow: true
+
+  # DINOv2 + LongMemory 默认开启（即使全程 slow 也会维护 codebook）
+  enable_long_memory: true
+  vlm_k_select: 2
+
+  debug_log: false
+  debug_every: 1
+
+  dino_model_path: "/root/autodl-fs/dinov2-base"
+  lm_tau_merge: 0.85
+  lm_tau_cut: 0.35
+  lm_ema_alpha_new: 0.2
+  lm_codebook_max_size: 12
+  lm_codebook_topm: 6
+  lm_codebook_evict: lru
+

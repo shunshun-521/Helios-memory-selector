@@ -33,32 +33,46 @@ export NCCL_IB_TIMEOUT=22
 #################################################################
 
 #################################################################
-## DIST
+## DIST (单机单卡)
 #################################################################
-MASTER_ADDR=$ARNOLD_WORKER_0_HOST
-ports=(`echo $METIS_WORKER_0_PORT | tr ',' ' '`)
-MASTER_PORT=${ports[0]}
-NNODES=$ARNOLD_WORKER_NUM
-NODE_RANK=$ARNOLD_ID
-GPUS_PER_NODE=$ARNOLD_WORKER_GPU
-
-# export CUDA_VISIBLE_DEVICES=1
-# MASTER_PORT=12345
-# GPUS_PER_NODE=1
-# NNODES=1
-# NODE_RANK=0
-
-WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
+MASTER_ADDR="127.0.0.1"
+MASTER_PORT=29500
+GPUS_PER_NODE=1
+NNODES=1
+NODE_RANK=0
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
-if [ ! -z $RDZV_BACKEND ]; then
-    DISTRIBUTED_ARGS="${DISTRIBUTED_ARGS} --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT --rdzv_id 9863 --rdzv_backend c10d"
-    export NCCL_SHM_DISABLE=1
-fi
 
 echo -e "\033[31mDISTRIBUTED_ARGS: ${DISTRIBUTED_ARGS}\033[0m"
 
 #################################################################
-# 
-torchrun $DISTRIBUTED_ARGS \
-    tools/offload_data/get_short-latents.py
+
+cd /root/autodl-tmp/Helios
+export PYTHONPATH=/root/autodl-tmp/Helios:$PYTHONPATH
+export OMP_NUM_THREADS=4
+
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-helios}"
+ENV_PREFIX="/root/miniconda3/envs/${CONDA_ENV_NAME}"
+TORCHRUN_BIN="${ENV_PREFIX}/bin/torchrun"
+
+if [ ! -x "$TORCHRUN_BIN" ]; then
+  echo "[ERROR] torchrun not found at: $TORCHRUN_BIN"
+  echo "Set CONDA_ENV_NAME or check your conda env path."
+  exit 1
+fi
+
+# Optional: override these for a single-sample run
+JSON_FILE="${JSON_FILE:-}"
+VIDEO_FOLDER="${VIDEO_FOLDER:-}"
+OUTPUT_LATENT_FOLDER="${OUTPUT_LATENT_FOLDER:-}"
+
+$TORCHRUN_BIN $DISTRIBUTED_ARGS \
+    tools/offload_data/get_short-latents.py \
+    --pretrained_model_name_or_path /root/autodl-fs/BestWishYSH/Helios-Base \
+    --dataloader_num_workers 20 \
+    ${JSON_FILE:+--json_file "$JSON_FILE"} \
+    ${VIDEO_FOLDER:+--video_folder "$VIDEO_FOLDER"} \
+    ${OUTPUT_LATENT_FOLDER:+--output_latent_folder "$OUTPUT_LATENT_FOLDER"} \
+    ${STRIDE:+--stride "$STRIDE"} \
+    ${BATCH_SIZE:+--batch_size "$BATCH_SIZE"} \
+    ${RESOLUTION:+--resolution "$RESOLUTION"}

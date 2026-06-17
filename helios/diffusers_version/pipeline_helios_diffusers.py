@@ -651,6 +651,7 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
         progress_bar=None,
     ):
         batch_size, num_channel, num_frames, height, width = latents.shape
+        orig_height, orig_width = height, width
         latents = latents.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, num_channel, height, width)
         for _ in range(pyramid_num_stages - 1):
             height //= 2
@@ -664,6 +665,15 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
                 * 2
             )
         latents = latents.reshape(batch_size, num_frames, num_channel, height, width).permute(0, 2, 1, 3, 4)
+
+        # Helper to resize history latents to match current pyramid spatial dims
+        def _resize_history(hist, tgt_h, tgt_w):
+            if hist is None or (hist.shape[-2] == tgt_h and hist.shape[-1] == tgt_w):
+                return hist
+            b, c, t, h, w = hist.shape
+            hist = hist.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+            hist = F.interpolate(hist, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False) * ((h * w) / (tgt_h * tgt_w))
+            return hist.reshape(b, t, c, tgt_h, tgt_w).permute(0, 2, 1, 3, 4)
 
         batch_size = latents.shape[0]
         start_point_list = None
@@ -717,6 +727,12 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
                 if self.config.is_distilled:
                     start_point_list.append(latents)
 
+            # Resize history latents to match current pyramid stage spatial dims
+            cur_h, cur_w = latents.shape[-2], latents.shape[-1]
+            stage_history_short = _resize_history(latents_history_short, cur_h, cur_w)
+            stage_history_mid = _resize_history(latents_history_mid, cur_h, cur_w)
+            stage_history_long = _resize_history(latents_history_long, cur_h, cur_w)
+
             for idx, t in enumerate(timesteps):
                 timestep = t.expand(latents.shape[0]).to(torch.int64)
 
@@ -731,9 +747,9 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
                         indices_latents_history_short=indices_latents_history_short,
                         indices_latents_history_mid=indices_latents_history_mid,
                         indices_latents_history_long=indices_latents_history_long,
-                        latents_history_short=latents_history_short.to(transformer_dtype),
-                        latents_history_mid=latents_history_mid.to(transformer_dtype),
-                        latents_history_long=latents_history_long.to(transformer_dtype),
+                        latents_history_short=stage_history_short.to(transformer_dtype),
+                        latents_history_mid=stage_history_mid.to(transformer_dtype),
+                        latents_history_long=stage_history_long.to(transformer_dtype),
                     )[0]
 
                 if self.do_classifier_free_guidance:
@@ -748,9 +764,9 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
                             indices_latents_history_short=indices_latents_history_short,
                             indices_latents_history_mid=indices_latents_history_mid,
                             indices_latents_history_long=indices_latents_history_long,
-                            latents_history_short=latents_history_short.to(transformer_dtype),
-                            latents_history_mid=latents_history_mid.to(transformer_dtype),
-                            latents_history_long=latents_history_long.to(transformer_dtype),
+                            latents_history_short=stage_history_short.to(transformer_dtype),
+                            latents_history_mid=stage_history_mid.to(transformer_dtype),
+                            latents_history_long=stage_history_long.to(transformer_dtype),
                         )[0]
 
                     if self.config.is_cfg_zero_star:
@@ -849,6 +865,7 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
         attention_kwargs: dict[str, Any] | None = None,
         callback_on_step_end: Callable[[int, int], None] | PipelineCallback | MultiPipelineCallbacks | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
+        chunk_callback: Callable[[int, torch.Tensor], None] | None = None,
         max_sequence_length: int = 512,
         # ------------ I2V ------------
         image: PipelineImageInput | None = None,
@@ -1153,15 +1170,17 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
                 indices_latents_history_short,
                 indices_hidden_states,
             ) = indices.split([*history_sizes, num_latent_frames_per_chunk], dim=0)
-        indices_hidden_states = indices_hidden_states.unsqueeze(0)
-        indices_latents_history_short = indices_latents_history_short.unsqueeze(0)
-        indices_latents_history_mid = indices_latents_history_mid.unsqueeze(0)
-        indices_latents_history_long = indices_latents_history_long.unsqueeze(0)
+        indices_hidden_states = indices_hidden_states.unsqueeze(0).expand(batch_size, -1)
+        indices_latents_history_short = indices_latents_history_short.unsqueeze(0).expand(batch_size, -1)
+        indices_latents_history_mid = indices_latents_history_mid.unsqueeze(0).expand(batch_size, -1)
+        indices_latents_history_long = indices_latents_history_long.unsqueeze(0).expand(batch_size, -1)
 
         # 6. Denoising loop
         if use_interpolate_prompt:
             if num_latent_chunk < max(interpolate_cumulative_list):
-                num_latent_chunk = sum(interpolate_cumulative_list)
+                # Expand to the required upper bound of prompt intervals,
+                # not the cumulative sum of cumulative boundaries.
+                num_latent_chunk = max(interpolate_cumulative_list)
                 print(f"Update num_latent_chunk to: {num_latent_chunk}")
 
         if not is_enable_stage2:
@@ -1327,6 +1346,16 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
                 total_generated_latent_frames += latents.shape[2]
                 history_latents = torch.cat([history_latents, latents], dim=2)
                 real_history_latents = history_latents[:, :, -total_generated_latent_frames:]
+
+                # Optional per-chunk callback.
+                # Called after chunk latents are generated and appended into history_latents.
+                # Useful for external logic that wants to update transformer hooks for next chunk.
+                if chunk_callback is not None:
+                    try:
+                        chunk_callback(k, latents)
+                    except Exception as e:
+                        logger.warning(f"chunk_callback failed at chunk={k}: {e}")
+
                 current_latents = (
                     real_history_latents[:, :, -num_latent_frames_per_chunk:].to(vae_dtype) / latents_std
                     + latents_mean

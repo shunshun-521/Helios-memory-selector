@@ -66,8 +66,8 @@ python create_video.py --csv prompt/light_change.csv --duration 10 --resolution 
 ```bash
 conda activate helios
 python /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/tools/offload_data/build_metadata_minimal.py \
-  --videos_dir /root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change/videos \
-  --out_json /root/autodl-tmp/Helios/example_memory_selector/seedance/video_light_change/metadata.json \
+  --videos_dir /root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_360/videos \
+  --out_json /root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_360/metadata.json \
   --seg_method scenedetect \
   --prompt_mode qwen_vl \
   --qwen_vl_prompt_source visual_batch \
@@ -82,6 +82,18 @@ python /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/tools/offloa
 - 分段结果：`segments[{start_sec,end_sec,start_chunk,end_chunk,prompt}]`
 - 备注：`segmentation_used=transnetv2`, `prompt_mode=qwen_vl`
 
+### Chunk 对齐策略（本次更新）
+
+为避免出现 `start_chunk/end_chunk` 重叠、导致同一 chunk 对应多个 prompt 的问题，`build_metadata_minimal.py` 已改为以下流程：
+
+1. 先在秒域做分段（TransNetV2），得到 `start_sec/end_sec`；
+2. 对每个分段生成 prompt（Qwen3-VL visual_batch）；
+3. 再做 chunk 归属：不再用 `floor/ceil` 扩边界，而是用 **chunk 中心点归属**；
+4. 如果某段在 chunk 域占比为 0（常见于很短段），则将该段并到前一段，并把 prompt 文本拼接到前一段（若是首段则并到后一段）；
+5. 最终输出严格左闭右开、无重叠的 chunk 区间，便于 DiT 在 chunk 级切换 prompt。
+
+这套规则与训练目标一致：你关心的是 DiT 看到的每个 chunk 只绑定一个 prompt，而不是秒级分段本身有多细。
+
 ---
 
 ## 4. Step C: 把MP4文件生成 `latents_short`（用于训练）
@@ -93,9 +105,9 @@ python /root/autodl-tmp/Helios/example_memory_selector/Selector_VLM/tools/offloa
 ```bash
 cd /root/autodl-tmp/Helios
 CONDA_ENV_NAME=helios \
-JSON_FILE=/root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_360/metadata.json \
-VIDEO_FOLDER=/root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_360 \
-OUTPUT_LATENT_FOLDER=/root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_360/latents_short \
+JSON_FILE=/root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_light_change/metadata.json \
+VIDEO_FOLDER=/root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_light_change \
+OUTPUT_LATENT_FOLDER=/root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_light_change/latents_short \
 STRIDE=1 BATCH_SIZE=4 RESOLUTION=640 \
 bash /root/autodl-tmp/Helios/tools/offload_data/get_short-latents.sh
 ```

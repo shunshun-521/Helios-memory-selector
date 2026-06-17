@@ -1,11 +1,11 @@
-output_dir: ablation_stage_1_post
-logging_dir: logs
+output_dir: /root/autodl-fs/output/6_1_post
+logging_dir: /root/autodl-fs/output/6_1_post/logs
 seed: 44
 
 
 report_to:
   tracker_name: Wan-Train
-  wandb_name: ablation_stage_1_post
+  wandb_name: /root/autodl-fs/output/6_1_post
   report_to: wandb
 
 
@@ -20,18 +20,18 @@ data_config:
   single_width: 640
   dataloader_num_workers: 8
   prefetch_factor: 2
-  caption_dropout_p: 0
+  caption_dropout_p: 0.05
   id_token: ""
   instance_data_root:
-    - "demo_data/ultravideo-long"
+    - "/root/autodl-tmp/Helios/example_memory_selector/veo/latents_short"
   # ---- Stage 1 ----
   use_stage1_dataset: true
 
 
 model_config:
   # ---- Path ----
-  pretrained_model_name_or_path: "BestWishYsh/Helios-Base"
-  transformer_model_name_or_path: "BestWishYsh/Helios-Base"
+  pretrained_model_name_or_path: "/root/autodl-fs/BestWishYSH/Helios-Base"
+  transformer_model_name_or_path: "/root/autodl-fs/BestWishYSH/Helios-Base"
   subfolder: "transformer_init"
   load_checkpoints_custom: false
   # load_model_path:
@@ -45,14 +45,14 @@ model_config:
   lora_rank: 128
   lora_alpha: 128.0
   lora_dropout: 0.0
-  lora_layers: "all-linear"
-  # lora_target_modules:
-  #   - to_k
-  #   - to_q
-  #   - to_v
-  #   - to_out.0
-  #   - ffn.net.0.proj
-  #   - ffn.net.2
+  lora_layers: null
+  lora_target_modules:
+    - to_k
+    - to_q
+    - to_v
+  #  - to_out.0
+  #  - ffn.net.0.proj
+  #  - ffn.net.2
   lora_exclude_modules:
     - down
     - up
@@ -61,14 +61,25 @@ model_config:
 
 
 validation_config:
+  first_step_valid: false
   validation_steps: 500
   validation_height: 384
   validation_width: 640
-  validation_max_num_frames: 99
-  validation_prompts:
-    - "A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about."
+  validation_max_num_frames: 300
+  # validation_prompts:
+  #  - "A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about."
     # - "Several giant wooly mammoths approach treading through a snowy meadow, their long wooly fur lightly blows in the wind as they walk, snow covered trees and dramatic snow capped mountains in the distance, mid afternoon light with wispy clouds and a sun high in the distance creates a warm glow, the low camera view is stunning capturing the large furry mammal with beautiful photography, depth of field."
     # - "A movie trailer featuring the adventures of the 30 year old space man wearing a red wool knitted motorcycle helmet, blue sky, salt desert, cinematic style, shot on 35mm film, vivid colors."
+  # Interactive validation (segmented prompts)
+  validation_prompts:
+    - "A sharp-dressed businessman in a charcoal three-piece suit, a pale blue pocket square folded into a perfect triangle, and a gold tie bar pinning a striped tie walks briskly across a sun-bleached plaza. The camera frames him from head to mid-thigh, his full upper body clearly visible — sharp jawline, slicked hair, confident expression. The pocket square is vivid. The gold tie bar glints sharply. The pinstripe of the suit is crisp in the hard light. He passes through a narrow concrete parking structure corridor. The fluorescent lights flicker and die midway — his silhouette is swallowed entirely, the suit's fine texture and pocket square dissolving into black, the gold tie bar gone. He strides out the other side into hard afternoon sun. The camera holds the same head-to-mid-thigh framing — his face catches the light first, then the pale blue pocket square blazes back into view. The gold tie bar glints sharply. The pinstripe of the suit snaps back into focus. He adjusts his cufflinks and walks on."
+
+  use_interpolate_prompt: false
+  interpolation_steps: 1
+  interpolate_time_list: [2, 3, 4]  # must satisfy min(interpolate_time_list) > interpolation_steps
+  # interpolation_steps: 1
+  # interpolate_time: 3
+  # interpolate_time_list: []
   validation_guidance_scale: 5.0
   validation_latent_window_size:
     - 9
@@ -87,10 +98,10 @@ training_config:
   mixed_precision: "bf16"
   # ---- Training Resource ----
   max_train_steps: 1000000
-  train_batch_size: 2
+  train_batch_size: 1
   gradient_accumulation_steps: 1
   checkpointing_steps: 500
-  resume_from_checkpoint: "latest"
+  resume_from_checkpoint: "checkpoint-500"
   save_checkpoints_custom: false
   # ---- Optimizer ----
   learning_rate: 3e-5

@@ -1,0 +1,32 @@
+training_config:
+  # infer_helios_ref_short.py 会读取这些字段传入 pipeline
+  use_ref_short: true
+  ref_frames_per_chunk: 3
+  history_sizes: [16, 2, 1]
+  latent_window_size: [9]
+
+selector_inference:
+  # 作为默认值；命令行参数会覆盖其中部分：
+  #   --selector_force_slow, --enable_long_memory, --vlm_k_select, --dino_model_path, --lm_tau_cut
+  selector_force_slow: true
+  # 默认开启 DINOv2 + LongMemory（cut gate + codebook）
+  enable_long_memory: false
+  vlm_k_select: 2
+  # 全 slow 长视频时用于限制历史候选池大小（单位: chunk）；
+  # 0 表示不限制。建议 32~96 之间按显存/速度调节。
+  slow_history_max_chunks: 48
+
+  # 调试日志（可选）
+  debug_log: true
+  debug_every: 1
+
+  # Long-memory / DINO-cut（可选；enable_long_memory=true 时生效）
+  # DINOv2 权重路径（按你的环境修改）
+  dino_model_path: "/root/autodl-fs/dinov2-base"
+  lm_tau_merge: 0.85
+  lm_tau_cut: 0.35
+  lm_ema_alpha_new: 0.2
+  lm_codebook_max_size: 12
+  lm_codebook_topm: 6
+  lm_codebook_evict: lru
+

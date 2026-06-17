@@ -1,17 +1,17 @@
-output_dir: ablation_stage_1_init
-logging_dir: logs
+output_dir: /root/autodl-fs/output/5_26_fuxian_5
+logging_dir: /root/autodl-fs/output/5_26_fuxian_5/logs
 seed: 43
 
 
 report_to:
   tracker_name: Wan-Train
-  wandb_name: ablation_stage_1_init
+  wandb_name: /root/autodl-fs/output/5_26_fuxian_5
   report_to: wandb
 
 
 data_config:
   # ---- Base ----
-  use_shuffle: true
+  use_shuffle: true #true
   pin_memory: true
   persistent_workers: true
   force_rebuild: true
@@ -23,15 +23,17 @@ data_config:
   caption_dropout_p: 0
   id_token: ""
   instance_data_root:
-    - "demo_data/ultravideo-long"
+  #    - "/root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_light_change/latents_short_only"
+     -  "/root/autodl-fs/HeliosBench-Weights/demo_data/one-only"
+  #  - "/root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_light_change/latents_short"
   # ---- Stage 1 ----
   use_stage1_dataset: true
 
 
 model_config:
   # ---- Path ----
-  pretrained_model_name_or_path: "BestWishYsh/Helios-Base"
-  transformer_model_name_or_path: "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+  pretrained_model_name_or_path: "/root/autodl-fs/BestWishYSH/Helios-Base"
+  transformer_model_name_or_path: "/root/autodl-fs/Wan-AI/Wan2.1-T2V-14B-Diffusers"
   load_checkpoints_custom: false
   # load_model_path:
   load_dcp: false
@@ -41,7 +43,7 @@ model_config:
   enable_slicing: false
   enable_tiling: false
   # ---- Lora ----
-  lora_rank: 128
+  lora_rank: 128    #128
   lora_alpha: 128.0
   lora_dropout: 0.0
   lora_layers: "all-linear"
@@ -60,15 +62,21 @@ model_config:
 
 
 validation_config:
-  validation_steps: 500
+  first_step_valid: true
+  validation_steps: 250 #10000
   validation_height: 384
   validation_width: 640
-  validation_max_num_frames: 99
+  validation_max_num_frames: 198
+  # Interactive validation (segmented prompts)
   validation_prompts:
-    - "A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about."
-    # - "Several giant wooly mammoths approach treading through a snowy meadow, their long wooly fur lightly blows in the wind as they walk, snow covered trees and dramatic snow capped mountains in the distance, mid afternoon light with wispy clouds and a sun high in the distance creates a warm glow, the low camera view is stunning capturing the large furry mammal with beautiful photography, depth of field."
-    # - "A movie trailer featuring the adventures of the 30 year old space man wearing a red wool knitted motorcycle helmet, blue sky, salt desert, cinematic style, shot on 35mm film, vivid colors."
-  validation_guidance_scale: 5.0
+     - "A playful interaction between two individuals, a woman and a young girl, who are seated on a bed in a cozy, well-lit room. The woman, dressed in a beige sweater and blue jeans, and the girl, wearing a gray sweater and blue jeans, are engaged in a game of rock-paper-scissors. They both make exaggerated gestures with their hands, indicating the various moves of the game. The woman's hands are raised in the air, while the girl's hands are clenched into fists. They both laugh and cheer as they play, with the woman's laughter being particularly loud and enthusiastic. The room is decorated with soft lighting and star-shaped decorations, creating a warm and inviting atmosphere. The bed they are sitting on is covered with a white blanket, and there are pillows scattered around them. The overall mood of the video is joyful and lighthearted, with the two individuals clearly enjoying their time together."
+  #  - "A skateboarder in a white t-shirt with a red lightning bolt walks down a suburban street, holding his board as the sun casts long shadows."
+  #  - "The skateboarder walks into a graffiti-covered tunnel, his shadow stretching on the concrete walls as he moves deeper into the dim space."
+  #  - "Emerging from the tunnel, the skateboarder rides his board out into the bright daylight, silhouetted against the open sky."
+  # use_interpolate_prompt: false
+  # interpolation_steps: 1
+  # interpolate_time_list: [2, 3, 4]  # must satisfy min(interpolate_time_list) > interpolation_steps
+  validation_guidance_scale: 5 #5
   validation_latent_window_size:
     - 9
   num_validation_videos: 1
@@ -85,16 +93,16 @@ training_config:
   offload: false
   mixed_precision: "bf16"
   # ---- Training Resource ----
-  max_train_steps: 1000000
-  train_batch_size: 2
+  max_train_steps: 100000  #100000
+  train_batch_size: 1  #16
   gradient_accumulation_steps: 1
-  checkpointing_steps: 500
+  checkpointing_steps: 500  #500
   resume_from_checkpoint: "latest"
   save_checkpoints_custom: false
   # ---- Optimizer ----
   learning_rate: 5e-5
   lr_scheduler: "constant"
-  lr_warmup_steps: 500
+  lr_warmup_steps: 500  #250
   optimizer: "adamw"
   adam_beta1: 0.9
   adam_beta2: 0.999
@@ -137,7 +145,7 @@ training_config:
     # - 3
     # - 2
     # - 1
-  is_random_drop: true
+  is_random_drop: true #true
   random_drop_v2v_ratio: 0.4
   random_drop_t2v_ratio: 0.4
   # 

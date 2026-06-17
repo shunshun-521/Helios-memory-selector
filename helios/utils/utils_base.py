@@ -238,6 +238,42 @@ def save_extra_components(args, model=None, model_state_dict=None, output_dir=No
                 for k, v in model.gan_final_head.state_dict().items():
                     state_dict[f"gan_final_head.{k}"] = v.detach().clone().cpu()
 
+    # 5. Save patch_ref (ref-short path; merge via transformer_partial.pth + merge_lora_base.py)
+    if getattr(args.training_config, "use_ref_short", False) and (
+        getattr(args.training_config, "is_train_full_patch_ref", False)
+        or getattr(args.training_config, "is_train_lora_patch_ref", False)
+    ):
+        if use_state_dict:
+            for k, v in model_state_dict.items():
+                if k.startswith("patch_ref."):
+                    state_dict[k] = v.detach().clone().cpu() if torch.is_tensor(v) else v
+        elif hasattr(model, "patch_ref"):
+            for k, v in model.patch_ref.state_dict().items():
+                state_dict["patch_ref." + k] = v.detach().clone().cpu()
+
+    # 6. Save Selector parameters (selector v2: q_proj, q, k, text_proj, target_proj, time_proj, patch_selected)
+    if getattr(args.training_config, 'use_selector', False):
+        selector_module_names = ["selector_q_proj", "selector_q", "selector_k", "selector_text_proj", "selector_target_proj", "selector_time_proj", "selector_spatial_pe", "patch_selected"]
+        selector_count = 0
+        if use_state_dict:
+            for k, v in model_state_dict.items():
+                if any(k.startswith(name + ".") or k == name for name in selector_module_names):
+                    state_dict[k] = v.detach().clone().cpu() if torch.is_tensor(v) else v
+                    selector_count += 1
+        else:
+            for name in selector_module_names:
+                if hasattr(model, name):
+                    attr = getattr(model, name)
+                    if isinstance(attr, torch.nn.Parameter):
+                        state_dict[name] = attr.detach().clone().cpu()
+                        selector_count += 1
+                    else:
+                        for k, v in attr.state_dict().items():
+                            state_dict[f"{name}.{k}"] = v.detach().clone().cpu()
+                            selector_count += 1
+        if selector_count > 0:
+            print(f"[Selector] Saved {selector_count} parameters for selector modules")
+
     torch.save(state_dict, os.path.join(output_dir, "transformer_partial.pth"))
     print(f"Saved checkpoint with {len(state_dict)} parameters to {output_dir}/transformer_partial.pth")
 
@@ -265,6 +301,21 @@ def load_extra_components(args, model, checkpoint_path):
                 print(f"  Missing keys in clean_patch_embedding: {load_info.missing_keys}")
             if load_info.unexpected_keys:
                 print(f"  Unexpected keys in clean_patch_embedding: {load_info.unexpected_keys}")
+
+    # Load patch_ref (ref-short)
+    if getattr(args.training_config, "use_ref_short", False) and hasattr(model, "patch_ref"):
+        patch_ref_keys_in_sd = [k for k in state_dict.keys() if k.startswith("patch_ref.")]
+        if patch_ref_keys_in_sd:
+            patch_ref_state = {
+                k.replace("patch_ref.", ""): v for k, v in state_dict.items() if k.startswith("patch_ref.")
+            }
+            load_info = model.patch_ref.load_state_dict(patch_ref_state, strict=False)
+            loaded_keys.update(patch_ref_keys_in_sd)
+            print(f"Loaded {len(patch_ref_keys_in_sd)} parameters for patch_ref")
+            if load_info.missing_keys:
+                print(f"  Missing keys in patch_ref: {load_info.missing_keys}")
+            if load_info.unexpected_keys:
+                print(f"  Unexpected keys in patch_ref: {load_info.unexpected_keys}")
 
     # Load LoRA layers
     lora_keys_count = 0
@@ -377,6 +428,33 @@ def load_extra_components(args, model, checkpoint_path):
 
         if gan_keys_count > 0:
             print(f"Loaded {gan_keys_count} parameters for GAN components")
+
+    # Load Selector parameters (selector v2)
+    selector_keys_count = 0
+    if getattr(args.training_config, 'use_selector', False):
+        selector_module_names = ["selector_q_proj", "selector_q", "selector_k", "selector_text_proj", "selector_target_proj", "selector_time_proj", "selector_spatial_pe", "patch_selected"]
+        for name in selector_module_names:
+            # Handle nn.Parameter (no sub-keys, stored as bare name)
+            if name in state_dict and hasattr(model, name):
+                attr = getattr(model, name)
+                if isinstance(attr, torch.nn.Parameter):
+                    attr.data = state_dict[name].to(attr.device)
+                    loaded_keys.add(name)
+                    selector_keys_count += 1
+                    continue
+            prefix = f"{name}."
+            sel_keys = [k for k in state_dict.keys() if k.startswith(prefix)]
+            if sel_keys and hasattr(model, name):
+                sel_state = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
+                load_info = getattr(model, name).load_state_dict(sel_state, strict=False)
+                loaded_keys.update(sel_keys)
+                selector_keys_count += len(sel_keys)
+                if load_info.missing_keys:
+                    print(f"  Missing keys in {name}: {load_info.missing_keys}")
+                if load_info.unexpected_keys:
+                    print(f"  Unexpected keys in {name}: {load_info.unexpected_keys}")
+        if selector_keys_count > 0:
+            print(f"[Selector] Loaded {selector_keys_count} parameters for selector modules")
 
     if not loaded_keys:
         print("No extra components were loaded from the checkpoint.")

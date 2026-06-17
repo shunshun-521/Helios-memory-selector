@@ -1,0 +1,68 @@
+output_dir: /root/autodl-fs/output/5_20_ref
+seed: 43
+
+data_config:
+  feature_folders:
+    - "/root/autodl-tmp/Helios/data_memory_selector/apdcephfs_qy2/share_302508595/xiaodayang/seedance/seedance/video_light_change/latents_short_only"
+
+model_config:
+  # 注意：checkpoint-1500 本身是 LoRA 权重，不是完整 transformer 目录，不能直接填这里。
+  # 若要“基于 step1500”继续训练 ref-attn，请先把 LoRA merge 到一个完整模型目录，再把该目录填到 transformer_path。
+  transformer_path: "/root/autodl-fs/output/5_19_ref/merged"
+  # VAE / scheduler 仍从完整 base model 目录读取
+  base_model_path: "/root/autodl-fs/BestWishYSH/Helios-Base"
+  clip_model_path: "/root/autodl-fs/clip-vit-large-patch14/AI-ModelScope/clip-vit-large-patch14"
+
+bolt_config:
+  active_layers: "33-39"
+  attn_dim: 1280
+  num_heads: 10
+  k_select: 1
+  min_chunk_distance: 3
+  alpha: 0.3
+  power: 1.5
+
+selector_training:
+  selector_type: vlm
+  vlm_model_path: "/root/autodl-fs/Qwen2.5-VL-3B-Instruct"
+  vlm_score_mode: "yes_no"
+  vlm_rank_mode: "topk"
+  vlm_k_select: 2
+  vlm_max_candidates: 4
+
+training_config:
+  choice_idx_random_min: 1
+  num_epochs: 20000
+  bolt_lr: 1.5e-4
+  lr_gamma: 4.0e-4
+  weighting_scheme: "logit_normal"
+  optimize_target: "mse"
+  id_loss_lambda: 0.03
+  id_loss_max_refs: 1
+  id_dino_model_path: "/root/autodl-fs/dinov2-base"
+  loss_w_ema_beta: 0.95
+  grad_accum_steps: 1
+  max_grad_norm: 1.0
+  save_every: 50
+  resume_from: null
+
+validation_config:
+  validation_epochs: 20
+  validation_max_videos: 1
+  validation_height: 384
+  validation_width: 640
+  validation_num_frames: 99
+  validation_num_inference_steps: 50
+  validation_guidance_scale: 5.0
+  validation_latent_window_size: 9
+  validation_fps: 24
+  validation_seed: 43
+  validation_interactive_csv: "/root/autodl-fs/output/5_17/infer_compare_interactive/interactive_stage1_init_prompts.csv"
+  use_interpolate_prompt: true
+  interpolation_steps: 1
+  interpolate_time_list: [2, 3, 4]
+  enable_low_vram_mode: false
+
+selector_inference:
+  lm_tau_merge: 0.82
+  lm_tau_cut: 0.26

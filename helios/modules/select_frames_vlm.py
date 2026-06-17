@@ -67,20 +67,23 @@ class BaseSelector(ABC):
     ) -> List[Dict]:
         """从 history 中挑出可参与选帧的 GAP 条目。
 
-        规则与 select_gap_frames 一致：
+        规则与 select_gap_frames / ref_short_builder 一致：
           - 排除当前 chunk 的 context (history[current_chunk_idx - 1])
           - 与 target 的时间距离 >= min_chunk_distance
         """
+        from helios.modules.ref_short_gap import is_gap_chunk_eligible
+
         if current_chunk_idx < 2 or len(history) < 2:
             return []
 
-        raw_gap = [
-            e for e in history
-            if int(e["chunk_idx"]) < current_chunk_idx - 1
-        ]
         return [
-            e for e in raw_gap
-            if (current_chunk_idx - int(e["chunk_idx"])) >= self.min_chunk_distance
+            e
+            for e in history
+            if is_gap_chunk_eligible(
+                int(e["chunk_idx"]),
+                int(current_chunk_idx),
+                min_chunk_distance=self.min_chunk_distance,
+            )
         ]
 
 

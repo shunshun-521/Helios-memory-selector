@@ -1,0 +1,200 @@
+# Ref-Short Stage1 post — 在 stage_1_post.yaml 基础上增加 ref-short 字段
+# 训练配方（抗漂移 / guidance_cross_attn / LoRA 目标层）与 post 一致，便于 merge 回 Helios-Base 流程
+# merge: tools/merge_lora_base.py（LoRA + transformer_partial.pth 含 clean_patch_embedding + patch_ref）
+#
+# 注意: ref-short 选帧当前要求 train_batch_size=1（selector 离线路径）
+
+output_dir: /root/autodl-fs/output/ref_short_post_6_1
+logging_dir: /root/autodl-fs/output/ref_short_post_6_1/logs
+seed: 44
+
+report_to:
+  tracker_name: Wan-Train
+  wandb_name: /root/autodl-fs/output/ref_short_post_6_1
+  report_to: wandb
+
+data_config:
+  # ---- Base ----
+  use_shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  force_rebuild: true
+  single_res: true
+  single_height: 384
+  single_width: 640
+  dataloader_num_workers: 8
+  prefetch_factor: 2
+  caption_dropout_p: 0.05
+  id_token: ""
+  instance_data_root:
+    - "/root/autodl-tmp/Helios/example_memory_selector/veo/latents_short"
+  # ---- Stage 1 ----
+  use_stage1_dataset: true
+  return_vae_latent_for_ref: true
+
+model_config:
+  # ---- Path ----
+  pretrained_model_name_or_path: "/root/autodl-fs/BestWishYSH/Helios-Base"
+  transformer_model_name_or_path: "/root/autodl-fs/BestWishYSH/Helios-Base"
+  subfolder: "transformer_init"
+  load_checkpoints_custom: false
+  # load_model_path:
+  load_dcp: false
+  # load_dcp_path:
+  # ---- Vae ----
+  upcast_vae: true
+  enable_slicing: false
+  enable_tiling: false
+  # ---- Lora ----
+  lora_rank: 128
+  lora_alpha: 128.0
+  lora_dropout: 0.0
+  lora_layers: null
+  lora_target_modules:
+    - to_k
+    - to_q
+    - to_v
+  #  - to_out.0
+  lora_exclude_modules:
+    - down
+    - up
+  train_norm_layers: false
+
+validation_config:
+  first_step_valid: true
+  validation_steps: 500
+  validation_height: 384
+  validation_width: 640
+  validation_max_num_frames: 300
+  validation_prompts:
+    - "A sharp-dressed businessman in a charcoal three-piece suit, a pale blue pocket square folded into a perfect triangle, and a gold tie bar pinning a striped tie walks briskly across a sun-bleached plaza. The camera frames him from head to mid-thigh, his full upper body clearly visible — sharp jawline, slicked hair, confident expression. The pocket square is vivid. The gold tie bar glints sharply. The pinstripe of the suit is crisp in the hard light. He passes through a narrow concrete parking structure corridor. The fluorescent lights flicker and die midway — his silhouette is swallowed entirely, the suit's fine texture and pocket square dissolving into black, the gold tie bar gone. He strides out the other side into hard afternoon sun. The camera holds the same head-to-mid-thigh framing — his face catches the light first, then the pale blue pocket square blazes back into view. The gold tie bar glints sharply. The pinstripe of the suit snaps back into focus. He adjusts his cufflinks and walks on."
+  #  - "A skateboarder in a white t-shirt with a red lightning bolt walks down a suburban street, holding his board as the sun casts long shadows."
+  #  - "The skateboarder walks into a graffiti-covered tunnel, his shadow stretching on the concrete walls as he moves deeper into the dim space."
+  #  - "Emerging from the tunnel, the skateboarder rides his board out into the bright daylight, silhouetted against the open sky."
+  use_interpolate_prompt: false
+  validation_guidance_scale: 5.0
+  validation_latent_window_size:
+    - 9
+  validation_stream_chunk_size:
+    - 3
+  num_validation_videos: 1
+  num_inference_steps: 50
+
+training_config:
+  # ---- Ref-Short（相对 post 新增）----
+  use_ref_short: true
+  ref_frames_per_chunk: 1
+  is_train_full_patch_ref: true
+  is_train_lora_patch_ref: false
+  # ---- Environment ----
+  allow_tf32: false
+  gradient_checkpointing: true
+  enable_xformers_memory_efficient_attention: false
+  enable_npu_flash_attention: false
+  upcast_before_saving: false
+  offload: false
+  mixed_precision: "bf16"
+  # ---- Training Resource ----
+  max_train_steps: 7500
+  train_batch_size: 1
+  gradient_accumulation_steps: 1
+  checkpointing_steps: 500
+  # resume_from_checkpoint: null
+  save_checkpoints_custom: false
+  # ---- Optimizer ----
+  learning_rate: 3e-5
+  lr_scheduler: "constant"
+  lr_warmup_steps: 500
+  optimizer: "adamw"
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 1e-04
+  adam_epsilon: 1e-08
+  max_grad_norm: 1.0
+  weighting_scheme: "logit_normal"
+  logit_mean: 0.0
+  logit_std: 1.0
+  mode_scale: 1.29
+  # ---- Dynamic Shifting Parameters ----
+  use_dynamic_shifting: false
+  base_seq_len: 256
+  max_seq_len: 4096
+  base_shift: 0.5
+  max_shift: 1.15
+  vae_decode_type: "default"
+  # ---- EMA Parameters ----
+  use_ema: false
+  use_ema_validation: false
+  ema_decay: 0.999
+  ema_start_step: 250
+  ema_zero3_port: 10543
+  ema_deepspeed_config_file: "scripts/accelerate_configs/zero3.json"
+  # ---- Stage 1 Parameters（与 post 一致）----
+  is_enable_stage1: true
+  history_sizes:
+    - 16
+    - 2
+    - 1
+  latent_window_size:
+    - 9
+  is_random_drop: true
+  random_drop_v2v_ratio: 0.4
+  random_drop_t2v_ratio: 0.4
+  corrupt_model_input: false
+  corrupt_mode_model_input: "noise"
+  corrupt_mode_prob_model_input: 0.9
+  is_frame_independent_corrupt_model_input: true
+  is_chunk_independent_corrupt_model_input: false
+  noise_corrupt_ratio_model_input: 0.33333333333333
+  noise_corrupt_clean_prob_model_input: 0.1
+  downsample_min_corrupt_ratio_model_input: 0.9
+  downsample_max_corrupt_ratio_model_input: 1.0
+  corrupt_history: true
+  corrupt_mode_history: "noise"
+  corrupt_mode_prob_history: 0.9
+  is_frame_independent_corrupt_history: true
+  is_chunk_independent_corrupt_history: false
+  noise_corrupt_ratio_history_short: 0.33333333333333
+  noise_corrupt_ratio_history_mid: 0.33333333333333
+  noise_corrupt_ratio_history_long: 0.33333333333333
+  noise_corrupt_clean_prob_history: 0.1
+  downsample_min_corrupt_ratio_history: 0.9
+  downsample_max_corrupt_ratio_history: 1.0
+  is_amplify_history: false
+  history_scale_mode: "per_head"
+  is_train_full_patch_embedding: false
+  is_train_lora_patch_embedding: true
+  has_multi_term_memory_patch: true
+  is_train_full_clean_patch_embedding: true
+  is_train_lora_clean_patch_embedding: false
+  zero_history_timestep: true
+  guidance_cross_attn: true
+  restrict_self_attn: false
+  is_train_restrict_lora: false
+  restrict_lora: false
+  restrict_lora_rank: 128
+
+selector_training:
+  selector_type: vlm
+  selector_force_slow: true
+  debug_log: true
+  debug_every: 1
+  vlm_k_select: 1
+  vlm_min_chunk_distance: 2
+  vlm_model_path: "/root/autodl-fs/Qwen2.5-VL-3B-Instruct"
+  vlm_rank_mode: topk
+  enable_long_memory: false
+
+selector_inference:
+  selector_force_slow: false
+  enable_long_memory: true
+  debug_log: true
+  debug_every: 1
+  vlm_k_select: 2
+  dino_model_path: "/root/autodl-fs/dinov2-base"
+  lm_tau_merge: 0.85
+  lm_tau_cut: 0.35
+  lm_ema_alpha_new: 0.2
+  lm_codebook_max_size: 12
+  lm_codebook_topm: 6
+  lm_codebook_evict: lru
